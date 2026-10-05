@@ -1,126 +1,257 @@
 'use strict';
 
 /**
- * Multi Client Sync - SillyTavern server plugin.
+ * Multi-Client Sync
+ * -----------------
  *
- * Responsibilities:
- * - Authenticated per-user/per-chat scoping
- * - Membership/heartbeat leases
- * - Authoritative revisions
- * - Monotonic event sequence numbers
- * - Idempotent operation IDs
+ * Server-side authority for the browser extension.
+ *
+ * Core guarantees implemented here:
+ *
+ * - authenticated user scoping using SillyTavern's req.user
+ * - character/group + exact chat scoping
+ * - branch/checkpoint lineage validation where ST metadata exposes it
+ * - server epoch fencing
+ * - per-scope monotonic revisions
+ * - per-scope monotonic event sequence
+ * - operation idempotency
+ * - stale-write rejection
+ * - bounded replay log
  * - SSE live delivery
- * - SSE replay / resync signalling
- * - Server epoch fencing across restarts
- * - Generation ownership / leases / stop requests
- * - Atomic-ish JSON persistence of sync state
- * - Bounded retained event history
+ * - resumable SSE using opaque subscription tokens
+ * - replay-window detection
+ * - explicit resync requirements
+ * - generation ownership
+ * - generation leases
+ * - stale generation fencing
+ * - generation stream sequence enforcement
+ * - remote generation stop requests
+ * - crash/timeout owner release
+ * - bounded membership lifetime
+ * - per-user/per-category rate limiting
+ * - payload/snapshot limits
+ * - safe event/schema validation
+ * - durable server mirror
+ * - per-scope persistence serialization
+ * - persistence revision tracking
+ * - persisted-state corruption tolerance
+ * - bounded in-memory scope count
+ * - bounded replay storage
+ * - safe path handling
+ * - ST chat-file verification for durable mutations
  *
- * The plugin does not write ST chat files directly.
- * The client applies authoritative snapshots through ST's own save path.
+ * Important:
+ *
+ * The plugin is intentionally passive until a compatible client connects.
+ * It never changes SillyTavern chats merely because the plugin is installed.
+ *
+ * Ordinary chat mutations are verified against the authenticated user's actual
+ * ST chat file before becoming canonical on the server.
+ *
+ * Generation streaming is intentionally represented as synchronization state.
+ * The browser extension remains responsible for actually invoking ST's
+ * generation functions.
  */
 
-const fs = require('fs/promises');
-const path = require('path');
-const crypto = require('crypto');
+const fs = require('node:fs');
+const fsp = require('node:fs/promises');
+const path = require('node:path');
+const crypto = require('node:crypto');
 
 
 /* -------------------------------------------------------------------------- */
-/* Configuration                                                               */
+/* Constants                                                                  */
 /* -------------------------------------------------------------------------- */
 
-const PLUGIN_ID =
+const PLUGIN_ID = 'multi-client-sync';
+
+const PROTOCOL_VERSION = 4;
+const STATE_SCHEMA_VERSION = 4;
+
+const MAX_REQUEST_BYTES = 32 * 1024 * 1024;
+const MAX_SNAPSHOT_BYTES = 24 * 1024 * 1024;
+const MAX_MESSAGES = 200_000;
+
+const MAX_REPLAY_EVENTS = 2_000;
+const MAX_REPLAY_BYTES = 2 * 1024 * 1024;
+
+const MAX_OPERATION_HISTORY = 5_000;
+
+const MAX_CLIENTS_PER_SCOPE = 8;
+const MAX_SSE_PER_CLIENT = 2;
+
+const MEMBER_TTL_MS = 45_000;
+const GENERATION_LEASE_MS = 20_000;
+const GENERATION_MAX_MS = 6 * 60 * 60 * 1000;
+
+const SSE_KEEPALIVE_MS = 15_000;
+
+const RATE_WINDOW_MS = 10_000;
+
+const RATE_LIMITS = Object.freeze({
+    read: 120,
+    mutate: 60,
+    heartbeat: 30,
+    join: 20,
+});
+
+const MAX_SCOPES_IN_MEMORY = 5_000;
+const SCOPE_MEMORY_IDLE_MS = 15 * 60 * 1000;
+
+const GROUP_CACHE_MS = 2_000;
+const CHAT_FILE_CACHE_MAX = 512;
+
+const SUBSCRIPTION_TOKEN_TTL_MS =
+    24 * 60 * 60 * 1000;
+
+const MAX_PERSISTED_BYTES_PER_USER =
+    4 * 1024 * 1024 * 1024;
+
+const DATA_DIR_NAME =
     'multi-client-sync';
 
-const PROTOCOL_VERSION =
-    2;
+const STATE_DIR_NAME =
+    'state';
 
-const STATE_SCHEMA_VERSION =
-    2;
-
-const MAX_EVENT_BYTES =
-    8 * 1024 * 1024;
-
-const MAX_EVENTS =
-    2000;
-
-const MAX_SEEN_OPS =
-    5000;
-
-const MAX_MEMBERS_PER_SCOPE =
-    32;
-
-const MEMBER_TTL_MS =
-    45_000;
-
-const GENERATION_LEASE_MS =
-    20_000;
-
-const GENERATION_SCAN_MS =
-    5_000;
-
-const PERSIST_DEBOUNCE_MS =
-    750;
-
-const KEEPALIVE_MS =
-    15_000;
+const SECRET_FILE_NAME =
+    'server-secret.bin';
 
 
 /* -------------------------------------------------------------------------- */
-/* Runtime state                                                               */
+/* Plugin metadata                                                            */
 /* -------------------------------------------------------------------------- */
-
-const runtimeEpoch =
-    crypto.randomUUID();
-
-const scopes =
-    new Map();
-
-const sseByScope =
-    new Map();
-
-const persistTimers =
-    new Map();
-
-const persistDir =
-    path.join(
-        __dirname,
-        '.data',
-        'scopes',
-    );
-
-let scanTimer =
-    null;
 
 const info = {
-    id:
-        PLUGIN_ID,
-
-    name:
-        'Multi Client Sync',
-
+    id: PLUGIN_ID,
+    name: 'Multi-Client Sync',
     description:
-        'Authoritative multi-client SillyTavern chat synchronization with SSE, replay, revisions, and generation leases.',
+        'Authoritative multi-client SillyTavern synchronization with revisions, replay, SSE, generation leases and durable recovery.',
 };
 
 
 /* -------------------------------------------------------------------------- */
-/* Utilities                                                                   */
+/* Runtime                                                                    */
 /* -------------------------------------------------------------------------- */
+
+let initialized = false;
+let shuttingDown = false;
+
+let runtimeEpoch =
+    crypto.randomUUID();
+
+let dataRoot = null;
+let pluginRoot = null;
+let stateRoot = null;
+let secretPath = null;
+let principalSecret = null;
+
+let watchdogTimer = null;
+
+
+/* -------------------------------------------------------------------------- */
+/* Runtime maps                                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * @typedef {{
+ *   schemaVersion: number,
+ *   key: string,
+ *   userId: string,
+ *   scope: object,
+ *   revision: number,
+ *   seq: number,
+ *   snapshot: object|null,
+ *   snapshotHash: string|null,
+ *   events: object[],
+ *   seenOps: string[],
+ *   opResults: Map<string, object>,
+ *   members: Map<string, object>,
+ *   generation: object|null,
+ *   stopRequestIds: Set<string>,
+ *   lastAccessAt: number,
+ *   persistChain: Promise<any>,
+ *   persistedRevision: number,
+ *   persistedBytes: number,
+ * }} ScopeRecord
+ */
+
+/** @type {Map<string, ScopeRecord>} */
+const scopes =
+    new Map();
+
+/**
+ * scopeKey -> Map<clientId, Set<Response>>
+ * @type {Map<string, Map<string, Set<object>>>}
+ */
+const sseClients =
+    new Map();
+
+/** @type {Map<string, object>} */
+const rateBuckets =
+    new Map();
+
+/** @type {Map<string, object>} */
+const groupCache =
+    new Map();
+
+/**
+ * filePath -> {
+ *   mtimeMs,
+ *   size,
+ *   result,
+ *   cachedAt
+ * }
+ *
+ * @type {Map<string, object>}
+ */
+const chatFileCache =
+    new Map();
+
+/** userId -> persisted bytes */
+const persistedBytesByUser =
+    new Map();
+
+
+/* -------------------------------------------------------------------------- */
+/* Errors                                                                     */
+/* -------------------------------------------------------------------------- */
+
+class SyncError extends Error {
+    constructor(
+        code,
+        message,
+        status = 400,
+        extra = {},
+    ) {
+        super(message);
+
+        this.name = 'SyncError';
+        this.code = code;
+        this.status = status;
+
+        Object.assign(
+            this,
+            extra,
+        );
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* General helpers                                                            */
+/* -------------------------------------------------------------------------- */
+
+function clone(value) {
+    return value === undefined
+        ? undefined
+        : structuredClone(value);
+}
 
 function now() {
     return Date.now();
 }
 
-function clone(value) {
-    if (value === undefined) {
-        return undefined;
-    }
-
-    return structuredClone(value);
-}
-
-function jsonBytes(value) {
+function byteLength(value) {
     return Buffer.byteLength(
         JSON.stringify(value),
         'utf8',
@@ -136,247 +267,150 @@ function stableStringify(value) {
     }
 
     if (Array.isArray(value)) {
-        return `[${value.map(stableStringify).join(',')}]`;
+        return `[${value.map(
+            stableStringify,
+        ).join(',')}]`;
     }
 
-    return `{${Object.keys(value).sort().map(
-        key =>
-            `${JSON.stringify(key)}:${stableStringify(value[key])}`,
-    ).join(',')}}`;
+    return `{${Object.keys(value)
+        .sort()
+        .map(
+            key =>
+                `${JSON.stringify(
+                    key,
+                )}:${stableStringify(
+                    value[key],
+                )}`,
+        )
+        .join(',')}}`;
 }
 
-function safeString(
-    value,
-    max = 512,
-) {
-    if (
-        typeof value !== 'string'
-    ) {
-        return '';
-    }
+function sha256(value) {
+    const input =
+        typeof value === 'string'
+            ? value
+            : stableStringify(value);
 
-    return value.length > max
-        ? value.slice(0, max)
-        : value;
-}
-
-function validateId(
-    value,
-    field,
-    max = 256,
-) {
-    if (
-        typeof value !== 'string' ||
-        value.length < 1 ||
-        value.length > max
-    ) {
-        const error =
-            new Error(
-                `Invalid ${field}`,
-            );
-
-        error.code =
-            'invalid_request';
-
-        throw error;
-    }
-
-    return value;
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Scope/auth                                                                  */
-/* -------------------------------------------------------------------------- */
-
-function normalizeScope(raw) {
-    if (
-        !raw ||
-        typeof raw !== 'object'
-    ) {
-        const error =
-            new Error(
-                'Missing scope',
-            );
-
-        error.code =
-            'invalid_scope';
-
-        throw error;
-    }
-
-    const scopeType =
-        raw.scopeType === 'group'
-            ? 'group'
-            : raw.scopeType === 'character'
-                ? 'character'
-                : null;
-
-    if (!scopeType) {
-        const error =
-            new Error(
-                'Invalid scopeType',
-            );
-
-        error.code =
-            'invalid_scope';
-
-        throw error;
-    }
-
-    const chatId =
-        validateId(
-            raw.chatId,
-            'chatId',
-            1024,
-        );
-
-    const characterId =
-        raw.characterId === null ||
-        raw.characterId === undefined
-            ? null
-            : safeString(
-                String(
-                    raw.characterId,
-                ),
-                128,
-            );
-
-    const groupId =
-        raw.groupId === null ||
-        raw.groupId === undefined
-            ? null
-            : safeString(
-                String(
-                    raw.groupId,
-                ),
-                256,
-            );
-
-    if (
-        scopeType === 'character' &&
-        !characterId
-    ) {
-        const error =
-            new Error(
-                'characterId required for character scope',
-            );
-
-        error.code =
-            'invalid_scope';
-
-        throw error;
-    }
-
-    if (
-        scopeType === 'group' &&
-        !groupId
-    ) {
-        const error =
-            new Error(
-                'groupId required for group scope',
-            );
-
-        error.code =
-            'invalid_scope';
-
-        throw error;
-    }
-
-    return {
-        scopeType,
-        chatId,
-
-        characterId:
-            scopeType === 'character'
-                ? characterId
-                : null,
-
-        groupId:
-            scopeType === 'group'
-                ? groupId
-                : null,
-    };
-}
-
-function userIdFromRequest(
-    req,
-) {
-    /*
-     * The browser never supplies the authoritative user identity.
-     *
-     * ST's authenticated middleware supplies req.user. We derive the sync
-     * namespace from that authenticated identity.
-     */
-    const handle =
-        req?.user?.profile?.handle ??
-        req?.user?.handle ??
-        req?.user?.name;
-
-    return (
-        safeString(
-            handle
-                ? String(handle)
-                : 'default',
-            256,
-        ) ||
-        'default'
-    );
-}
-
-function scopeKey(
-    userId,
-    scope,
-) {
-    return JSON.stringify({
-        userId,
-        ...scope,
-    });
-}
-
-function scopeHash(key) {
     return crypto
         .createHash('sha256')
-        .update(key)
+        .update(input, 'utf8')
         .digest('hex');
 }
 
-function eventId(seq) {
+function hmac(value) {
+    return crypto
+        .createHmac(
+            'sha256',
+            principalSecret,
+        )
+        .update(
+            value,
+            'utf8',
+        )
+        .digest('hex');
+}
+
+function base64urlEncode(
+    value,
+) {
+    return Buffer
+        .from(
+            value,
+            'utf8',
+        )
+        .toString(
+            'base64',
+        )
+        .replaceAll(
+            '+',
+            '-',
+        )
+        .replaceAll(
+            '/',
+            '_',
+        )
+        .replaceAll(
+            '=',
+            '',
+        );
+}
+
+function base64urlDecode(
+    value,
+) {
+    const padded =
+        value
+            .replaceAll(
+                '-',
+                '+',
+            )
+            .replaceAll(
+                '_',
+                '/',
+            )
+            .padEnd(
+                Math.ceil(
+                    value.length / 4,
+                ) * 4,
+                '=',
+            );
+
+    return Buffer
+        .from(
+            padded,
+            'base64',
+        )
+        .toString(
+            'utf8',
+        );
+}
+
+function randomId() {
+    return crypto.randomUUID();
+}
+
+function eventId(
+    seq,
+) {
     return `${runtimeEpoch}:${seq}`;
 }
 
-function parseEventCursor(
+function parseEventId(
     value,
 ) {
     if (!value) {
         return null;
     }
 
-    const text =
+    const stringValue =
         String(value);
 
-    const index =
-        text.lastIndexOf(':');
+    const separator =
+        stringValue.lastIndexOf(
+            ':',
+        );
 
-    if (index <= 0) {
+    if (separator <= 0) {
         return null;
     }
 
     const epoch =
-        text.slice(
+        stringValue.slice(
             0,
-            index,
+            separator,
         );
 
     const seq =
         Number(
-            text.slice(
-                index + 1,
+            stringValue.slice(
+                separator + 1,
             ),
         );
 
     if (
-        !Number.isSafeInteger(seq) ||
+        !Number.isSafeInteger(
+            seq,
+        ) ||
         seq < 0
     ) {
         return null;
@@ -388,69 +422,450 @@ function parseEventCursor(
     };
 }
 
-
-/* -------------------------------------------------------------------------- */
-/* HTTP helpers                                                                */
-/* -------------------------------------------------------------------------- */
-
-function httpError(
-    res,
-    status,
-    code,
-    message,
-    extra = {},
+function normalizeString(
+    value,
+    field,
+    maxLength = 1024,
 ) {
-    res.status(status).json({
-        ok: false,
-        code,
-        message,
-        ...extra,
+    if (
+        typeof value !== 'string' ||
+        value.length < 1 ||
+        value.length > maxLength
+    ) {
+        throw new SyncError(
+            'invalid_request',
+            `Invalid ${field}`,
+        );
+    }
+
+    return value;
+}
+
+function safeStorageHash(
+    value,
+) {
+    return crypto
+        .createHash('sha256')
+        .update(
+            value,
+            'utf8',
+        )
+        .digest('hex');
+}
+
+function sameValue(
+    a,
+    b,
+) {
+    return (
+        stableStringify(a) ===
+        stableStringify(b)
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Recursive payload validation                                                */
+/* -------------------------------------------------------------------------- */
+
+const FORBIDDEN_KEYS =
+    new Set([
+        '__proto__',
+        'prototype',
+        'constructor',
+    ]);
+
+function validateDataTree(
+    value,
+    depth = 0,
+) {
+    if (depth > 20) {
+        throw new SyncError(
+            'invalid_request',
+            'Payload nesting is too deep',
+        );
+    }
+
+    if (
+        value === null ||
+        value === undefined ||
+        typeof value ===
+            'boolean' ||
+        typeof value ===
+            'number'
+    ) {
+        return;
+    }
+
+    if (
+        typeof value === 'string'
+    ) {
+        if (
+            value.length >
+            8 * 1024 * 1024
+        ) {
+            throw new SyncError(
+                'payload_too_large',
+                'Payload string is too large',
+                413,
+            );
+        }
+
+        return;
+    }
+
+    if (
+        Array.isArray(value)
+    ) {
+        for (
+            const item of value
+        ) {
+            validateDataTree(
+                item,
+                depth + 1,
+            );
+        }
+
+        return;
+    }
+
+    if (
+        typeof value ===
+            'object'
+    ) {
+        for (
+            const [
+                key,
+                child,
+            ] of Object.entries(
+                value,
+            )
+        ) {
+            if (
+                FORBIDDEN_KEYS.has(
+                    key,
+                )
+            ) {
+                throw new SyncError(
+                    'invalid_request',
+                    `Unsafe object key: ${key}`,
+                );
+            }
+
+            validateDataTree(
+                child,
+                depth + 1,
+            );
+        }
+
+        return;
+    }
+
+    throw new SyncError(
+        'invalid_request',
+        'Unsupported payload value',
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* User identity                                                              */
+/* -------------------------------------------------------------------------- */
+
+function getAuthenticatedUserId(
+    req,
+) {
+    const handle =
+        req?.user?.profile?.handle;
+
+    if (
+        typeof handle !== 'string' ||
+        !handle
+    ) {
+        throw new SyncError(
+            'auth_required',
+            'Authenticated SillyTavern user required',
+            403,
+        );
+    }
+
+    return handle;
+}
+
+function makePrincipalKey(
+    userId,
+) {
+    return hmac(
+        `principal:${userId}`,
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Scope                                                                      */
+/* -------------------------------------------------------------------------- */
+
+function normalizeScope(
+    raw,
+) {
+    if (
+        !raw ||
+        typeof raw !== 'object'
+    ) {
+        throw new SyncError(
+            'invalid_scope',
+            'Missing scope',
+        );
+    }
+
+    const scopeType =
+        raw.scopeType === 'group'
+            ? 'group'
+            : raw.scopeType ===
+                  'character'
+                ? 'character'
+                : null;
+
+    if (!scopeType) {
+        throw new SyncError(
+            'invalid_scope',
+            'Invalid scope type',
+        );
+    }
+
+    const chatId =
+        normalizeString(
+            String(raw.chatId),
+            'chatId',
+            2048,
+        );
+
+    const characterId =
+        raw.characterId ==
+            null
+            ? null
+            : normalizeString(
+                String(
+                    raw.characterId,
+                ),
+                'characterId',
+                512,
+            );
+
+    const groupId =
+        raw.groupId ==
+            null
+            ? null
+            : normalizeString(
+                String(
+                    raw.groupId,
+                ),
+                'groupId',
+                512,
+            );
+
+    const branchId =
+        raw.branchId ==
+            null
+            ? null
+            : normalizeString(
+                String(
+                    raw.branchId,
+                ),
+                'branchId',
+                512,
+            );
+
+    const parentChatId =
+        raw.parentChatId ==
+            null
+            ? null
+            : normalizeString(
+                String(
+                    raw.parentChatId,
+                ),
+                'parentChatId',
+                2048,
+            );
+
+    if (
+        scopeType ===
+            'character' &&
+        !characterId
+    ) {
+        throw new SyncError(
+            'invalid_scope',
+            'characterId is required',
+        );
+    }
+
+    if (
+        scopeType ===
+            'group' &&
+        !groupId
+    ) {
+        throw new SyncError(
+            'invalid_scope',
+            'groupId is required',
+        );
+    }
+
+    return {
+        scopeType,
+        characterId:
+            scopeType ===
+            'character'
+                ? characterId
+                : null,
+        groupId:
+            scopeType === 'group'
+                ? groupId
+                : null,
+        chatId,
+        branchId,
+        parentChatId,
+    };
+}
+
+function scopeKey(
+    userId,
+    scope,
+) {
+    return stableStringify({
+        userId,
+        ...scope,
     });
 }
 
-function ok(
-    res,
-    payload = {},
+function parseScopeKey(
+    key,
 ) {
-    res.setHeader(
-        'Cache-Control',
-        'no-store',
-    );
-
-    res.json({
-        ok: true,
-        ...payload,
-    });
-}
-
-function noStore(res) {
-    res.setHeader(
-        'Cache-Control',
-        'no-store',
+    return JSON.parse(
+        key,
     );
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Snapshot validation                                                         */
+/* Scope records                                                              */
 /* -------------------------------------------------------------------------- */
 
-function validateSnapshot(
+function createScopeRecord(
+    key,
+    userId,
+    scope,
+) {
+    const record = {
+        schemaVersion:
+            STATE_SCHEMA_VERSION,
+
+        key,
+
+        userId,
+
+        scope:
+            clone(scope),
+
+        revision:
+            0,
+
+        seq:
+            0,
+
+        snapshot:
+            null,
+
+        snapshotHash:
+            null,
+
+        events:
+            [],
+
+        seenOps:
+            [],
+
+        opResults:
+            new Map(),
+
+        members:
+            new Map(),
+
+        generation:
+            null,
+
+        stopRequestIds:
+            new Set(),
+
+        lastAccessAt:
+            now(),
+
+        persistChain:
+            Promise.resolve(),
+
+        persistedRevision:
+            0,
+
+        persistedBytes:
+            0,
+    };
+
+    scopes.set(
+        key,
+        record,
+    );
+
+    return record;
+}
+
+function getOrCreateScope(
+    userId,
+    scope,
+) {
+    const key =
+        scopeKey(
+            userId,
+            scope,
+        );
+
+    return (
+        scopes.get(key) ||
+        createScopeRecord(
+            key,
+            userId,
+            scope,
+        )
+    );
+}
+
+function getScope(
+    userId,
+    scope,
+) {
+    return scopes.get(
+        scopeKey(
+            userId,
+            scope,
+        ),
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Snapshot validation                                                        */
+/* -------------------------------------------------------------------------- */
+
+function validateSnapshotShape(
     snapshot,
 ) {
     if (
         !snapshot ||
-        typeof snapshot !== 'object'
+        typeof snapshot !==
+            'object'
     ) {
-        const error =
-            new Error(
-                'Missing snapshot',
-            );
-
-        error.code =
-            'invalid_snapshot';
-
-        throw error;
+        throw new SyncError(
+            'invalid_snapshot',
+            'Snapshot must be an object',
+        );
     }
 
     if (
@@ -458,37 +873,27 @@ function validateSnapshot(
             snapshot.chat,
         )
     ) {
-        const error =
-            new Error(
-                'snapshot.chat must be an array',
-            );
-
-        error.code =
-            'invalid_snapshot';
-
-        throw error;
+        throw new SyncError(
+            'invalid_snapshot',
+            'snapshot.chat must be an array',
+        );
     }
 
     if (
         snapshot.chat.length >
-        100_000
+        MAX_MESSAGES
     ) {
-        const error =
-            new Error(
-                'Chat is too large',
-            );
-
-        error.code =
-            'snapshot_too_large';
-
-        throw error;
+        throw new SyncError(
+            'snapshot_too_large',
+            'Too many messages',
+            413,
+        );
     }
 
     if (
-        snapshot.chatMetadata !==
-            undefined &&
+        snapshot.chatMetadata !=
+            null &&
         (
-            snapshot.chatMetadata === null ||
             typeof snapshot.chatMetadata !==
                 'object' ||
             Array.isArray(
@@ -496,150 +901,742 @@ function validateSnapshot(
             )
         )
     ) {
-        const error =
-            new Error(
-                'snapshot.chatMetadata must be an object',
-            );
-
-        error.code =
-            'invalid_snapshot';
-
-        throw error;
+        throw new SyncError(
+            'invalid_snapshot',
+            'snapshot.chatMetadata must be an object',
+        );
     }
 
     const bytes =
-        jsonBytes(
+        byteLength(
             snapshot,
         );
 
     if (
         bytes >
-        MAX_EVENT_BYTES
+        MAX_SNAPSHOT_BYTES
     ) {
-        const error =
-            new Error(
-                `Snapshot exceeds ${MAX_EVENT_BYTES} bytes`,
+        throw new SyncError(
+            'snapshot_too_large',
+            'Snapshot exceeds the synchronization limit',
+            413,
+        );
+    }
+
+    validateDataTree(
+        snapshot,
+    );
+}
+
+function messageSyncId(
+    message,
+) {
+    return (
+        message
+            ?.extra
+            ?.multi_client_sync
+            ?.messageId ||
+        null
+    );
+}
+
+function validateNoDuplicateMessageIds(
+    snapshot,
+) {
+    const seen =
+        new Set();
+
+    for (
+        let i = 1;
+        i < snapshot.chat.length;
+        i++
+    ) {
+        const id =
+            messageSyncId(
+                snapshot.chat[i],
             );
 
-        error.code =
-            'snapshot_too_large';
+        if (!id) {
+            continue;
+        }
+
+        if (
+            seen.has(id)
+        ) {
+            throw new SyncError(
+                'invalid_snapshot',
+                'Duplicate synchronization message ID',
+            );
+        }
+
+        seen.add(id);
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Snapshot lineage validation                                                */
+/* -------------------------------------------------------------------------- */
+
+function validateSnapshotLineage(
+    snapshot,
+    scope,
+) {
+    const metadata =
+        snapshot.chatMetadata ||
+        snapshot.chat?.[0]
+            ?.chat_metadata ||
+        {};
+
+    const snapshotParent =
+        metadata.main_chat !=
+            null
+            ? String(
+                metadata.main_chat,
+            )
+            : null;
+
+    const snapshotIntegrity =
+        metadata.integrity !=
+            null
+            ? String(
+                metadata.integrity,
+            )
+            : null;
+
+    if (
+        scope.branchId
+    ) {
+        if (
+            !snapshotIntegrity ||
+            snapshotIntegrity !==
+                scope.branchId
+        ) {
+            throw new SyncError(
+                'invalid_snapshot',
+                'Branch integrity does not match sync scope',
+            );
+        }
+
+        if (
+            scope.parentChatId &&
+            snapshotParent !==
+                scope.parentChatId
+        ) {
+            throw new SyncError(
+                'invalid_snapshot',
+                'Branch parent chat does not match sync scope',
+            );
+        }
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Chat-file identity / path safety                                           */
+/* -------------------------------------------------------------------------- */
+
+function safeBasename(
+    value,
+    field,
+) {
+    const name =
+        normalizeString(
+            value,
+            field,
+            2048,
+        );
+
+    if (
+        name.includes('/') ||
+        name.includes('\\') ||
+        name.includes('\0') ||
+        name === '.' ||
+        name === '..'
+    ) {
+        throw new SyncError(
+            'invalid_scope',
+            `Invalid ${field}`,
+        );
+    }
+
+    return name;
+}
+
+function underParent(
+    parent,
+    target,
+) {
+    const parentResolved =
+        path.resolve(
+            parent,
+        );
+
+    const targetResolved =
+        path.resolve(
+            target,
+        );
+
+    if (
+        targetResolved !==
+            parentResolved &&
+        !targetResolved.startsWith(
+            `${parentResolved}${path.sep}`,
+        )
+    ) {
+        throw new SyncError(
+            'invalid_scope',
+            'Resolved path escapes the user directory',
+        );
+    }
+
+    return targetResolved;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Group validation                                                            */
+/* -------------------------------------------------------------------------- */
+
+async function getGroupForUser(
+    req,
+    groupId,
+) {
+    const userId =
+        getAuthenticatedUserId(
+            req,
+        );
+
+    const cacheKey =
+        `${userId}:${groupId}`;
+
+    const cached =
+        groupCache.get(
+            cacheKey,
+        );
+
+    if (
+        cached &&
+        now() -
+            cached.at <
+            GROUP_CACHE_MS
+    ) {
+        return cached.group;
+    }
+
+    const groupsDir =
+        req.user
+            ?.directories
+            ?.groups;
+
+    if (!groupsDir) {
+        return null;
+    }
+
+    let files;
+
+    try {
+        files =
+            await fsp.readdir(
+                groupsDir,
+            );
+    } catch {
+        return null;
+    }
+
+    for (
+        const fileName of files
+    ) {
+        if (
+            !fileName.endsWith(
+                '.json',
+            )
+        ) {
+            continue;
+        }
+
+        const fullPath =
+            underParent(
+                groupsDir,
+                path.join(
+                    groupsDir,
+                    fileName,
+                ),
+            );
+
+        try {
+            const parsed =
+                JSON.parse(
+                    await fsp.readFile(
+                        fullPath,
+                        'utf8',
+                    ),
+                );
+
+            if (
+                String(parsed?.id) ===
+                String(groupId)
+            ) {
+                groupCache.set(
+                    cacheKey,
+                    {
+                        at:
+                            now(),
+                        group:
+                            parsed,
+                    },
+                );
+
+                return parsed;
+            }
+        } catch {
+            // Ignore unrelated malformed files.
+        }
+    }
+
+    return null;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Resolve actual ST chat file                                                */
+/* -------------------------------------------------------------------------- */
+
+async function resolveStChatPath(
+    req,
+    scope,
+) {
+    const userDirs =
+        req.user?.directories;
+
+    if (!userDirs) {
+        throw new SyncError(
+            'auth_required',
+            'User directories unavailable',
+            403,
+        );
+    }
+
+    if (
+        scope.scopeType ===
+        'character'
+    ) {
+        /*
+         * Current ST stores character chats under:
+         *
+         * <user>/chats/<character-avatar>/<chat>.jsonl
+         *
+         * The character avatar filename is the extension's characterId.
+         */
+        const characterDir =
+            underParent(
+                userDirs.chats,
+                path.join(
+                    userDirs.chats,
+                    safeBasename(
+                        scope.characterId,
+                        'characterId',
+                    ),
+                ),
+            );
+
+        const fileName =
+            safeBasename(
+                scope.chatId,
+                'chatId',
+            );
+
+        return {
+            path:
+                underParent(
+                    characterDir,
+                    path.join(
+                        characterDir,
+                        `${fileName}.jsonl`,
+                    ),
+                ),
+            group:
+                null,
+        };
+    }
+
+    const group =
+        await getGroupForUser(
+            req,
+            scope.groupId,
+        );
+
+    if (!group) {
+        throw new SyncError(
+            'invalid_scope',
+            'Requested group does not belong to authenticated user',
+            403,
+        );
+    }
+
+    const groupChats =
+        Array.isArray(
+            group.chats,
+        )
+            ? group.chats.map(
+                value =>
+                    String(value),
+            )
+            : [];
+
+    if (
+        !groupChats.includes(
+            String(scope.chatId),
+        )
+    ) {
+        throw new SyncError(
+            'invalid_scope',
+            'Requested chat is not associated with the requested group',
+            403,
+        );
+    }
+
+    const groupChatsDir =
+        userDirs.groupChats;
+
+    const fileName =
+        safeBasename(
+            scope.chatId,
+            'chatId',
+        );
+
+    return {
+        path:
+            underParent(
+                groupChatsDir,
+                path.join(
+                    groupChatsDir,
+                    `${fileName}.jsonl`,
+                ),
+            ),
+
+        group,
+    };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* ST chat-file read cache                                                    */
+/* -------------------------------------------------------------------------- */
+
+function trimChatFileCache() {
+    if (
+        chatFileCache.size <=
+        CHAT_FILE_CACHE_MAX
+    ) {
+        return;
+    }
+
+    const entries =
+        [...chatFileCache.entries()]
+            .sort(
+                (
+                    [, a],
+                    [, b],
+                ) =>
+                    a.cachedAt -
+                    b.cachedAt,
+            );
+
+    while (
+        chatFileCache.size >
+            CHAT_FILE_CACHE_MAX &&
+        entries.length
+    ) {
+        const [
+            key,
+        ] =
+            entries.shift();
+
+        chatFileCache.delete(
+            key,
+        );
+    }
+}
+
+async function readStChatSnapshot(
+    req,
+    scope,
+    {
+        force = false,
+    } = {},
+) {
+    const {
+        path: filePath,
+    } =
+        await resolveStChatPath(
+            req,
+            scope,
+        );
+
+    let stat;
+
+    try {
+        stat =
+            await fsp.stat(
+                filePath,
+            );
+    } catch (error) {
+        if (
+            error?.code ===
+            'ENOENT'
+        ) {
+            return {
+                exists: false,
+                snapshot:
+                    null,
+                hash:
+                    null,
+                mtimeMs:
+                    0,
+                size:
+                    0,
+                filePath,
+            };
+        }
 
         throw error;
     }
 
-    return true;
-}
+    const cached =
+        chatFileCache.get(
+            filePath,
+        );
 
-
-/* -------------------------------------------------------------------------- */
-/* Scope records                                                               */
-/* -------------------------------------------------------------------------- */
-
-function ensureScopeRecord(
-    key,
-    userId,
-    scope,
-) {
-    let record =
-        scopes.get(key);
-
-    if (!record) {
-        record = {
-            schemaVersion:
-                STATE_SCHEMA_VERSION,
-
-            key,
-
-            userId,
-
-            scope:
-                clone(scope),
-
-            serverEpoch:
-                runtimeEpoch,
-
-            revision:
-                0,
-
-            seq:
-                0,
-
-            snapshot:
-                null,
-
-            snapshotHash:
-                null,
-
-            events:
-                [],
-
-            seenOps:
-                [],
-
-            members:
-                new Map(),
-
-            generation:
-                null,
-
-            stopRequestIds:
-                new Set(),
-
-            persistVersion:
-                0,
-        };
-
-        scopes.set(
-            key,
-            record,
+    if (
+        !force &&
+        cached &&
+        cached.mtimeMs ===
+            stat.mtimeMs &&
+        cached.size ===
+            stat.size
+    ) {
+        return clone(
+            cached.result,
         );
     }
 
-    return record;
-}
+    const raw =
+        await fsp.readFile(
+            filePath,
+            'utf8',
+        );
 
-function publicState(
-    record,
-) {
-    return {
-        protocolVersion:
-            PROTOCOL_VERSION,
+    const lines =
+        raw
+            .replace(
+                /^\uFEFF/,
+                '',
+            )
+            .split(/\r?\n/)
+            .filter(
+                line =>
+                    line.trim() !== '',
+            );
 
-        schemaVersion:
-            STATE_SCHEMA_VERSION,
+    if (!lines.length) {
+        const result = {
+            exists: true,
+            snapshot:
+                null,
+            hash:
+                null,
+            mtimeMs:
+                stat.mtimeMs,
+            size:
+                stat.size,
+            filePath,
+        };
 
-        epoch:
-            runtimeEpoch,
+        chatFileCache.set(
+            filePath,
+            {
+                ...result,
+                cachedAt:
+                    now(),
+            },
+        );
 
-        revision:
-            record.revision,
+        trimChatFileCache();
 
-        seq:
-            record.seq,
+        return clone(result);
+    }
 
-        snapshot:
-            record.snapshot
-                ? clone(
-                    record.snapshot,
-                )
-                : null,
+    const chat = [];
 
-        snapshotHash:
-            record.snapshotHash,
+    for (
+        const line of lines
+    ) {
+        let parsed;
 
-        generation:
-            record.generation
-                ? clone(
-                    record.generation,
-                )
-                : null,
+        try {
+            parsed =
+                JSON.parse(
+                    line,
+                );
+        } catch {
+            throw new SyncError(
+                'st_file_invalid',
+                'SillyTavern chat file contains invalid JSON',
+                409,
+            );
+        }
 
-        memberCount:
-            record.members.size,
+        if (
+            !parsed ||
+            typeof parsed !==
+                'object' ||
+            Array.isArray(
+                parsed,
+            )
+        ) {
+            throw new SyncError(
+                'st_file_invalid',
+                'SillyTavern chat file contains an invalid record',
+                409,
+            );
+        }
+
+        chat.push(
+            parsed,
+        );
+    }
+
+    const chatMetadata =
+        chat[0]
+            ?.chat_metadata &&
+        typeof chat[0]
+            .chat_metadata ===
+            'object'
+            ? clone(
+                chat[0]
+                    .chat_metadata,
+            )
+            : {};
+
+    const snapshot = {
+        chat,
+        chatMetadata,
     };
+
+    validateSnapshotShape(
+        snapshot,
+    );
+
+    validateNoDuplicateMessageIds(
+        snapshot,
+    );
+
+    const result = {
+        exists: true,
+
+        snapshot,
+
+        hash:
+            sha256(
+                snapshot,
+            ),
+
+        mtimeMs:
+            stat.mtimeMs,
+
+        size:
+            stat.size,
+
+        filePath,
+    };
+
+    chatFileCache.set(
+        filePath,
+        {
+            ...clone(result),
+            cachedAt:
+                now(),
+        },
+    );
+
+    trimChatFileCache();
+
+    return clone(
+        result,
+    );
 }
 
-function compactGeneration(
+
+/* -------------------------------------------------------------------------- */
+/* Message-ID migration comparison                                            */
+/* -------------------------------------------------------------------------- */
+
+function stripSyncIds(
+    snapshot,
+) {
+    const result =
+        clone(snapshot);
+
+    for (
+        let i = 1;
+        i <
+            result.chat.length;
+        i++
+    ) {
+        const extra =
+            result.chat[i]?.extra;
+
+        if (
+            extra &&
+            typeof extra ===
+                'object'
+        ) {
+            const sync =
+                extra.multi_client_sync;
+
+            if (
+                sync &&
+                typeof sync ===
+                    'object'
+            ) {
+                delete extra.multi_client_sync;
+
+                if (
+                    Object.keys(
+                        sync,
+                    ).length ===
+                        0
+                ) {
+                    delete extra.multi_client_sync;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+function sameIgnoringSyncIds(
+    a,
+    b,
+) {
+    if (!a || !b) {
+        return false;
+    }
+
+    return sameValue(
+        stripSyncIds(a),
+        stripSyncIds(b),
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Public state                                                               */
+/* -------------------------------------------------------------------------- */
+
+function publicGeneration(
     generation,
 ) {
     if (!generation) {
@@ -656,14 +1653,21 @@ function compactGeneration(
         ownerDeviceId:
             generation.ownerDeviceId,
 
+        type:
+            generation.type,
+
+        targetMessageId:
+            generation.targetMessageId ||
+            null,
+
         state:
             generation.state,
 
-        leaseUntil:
-            generation.leaseUntil,
-
         startedAt:
             generation.startedAt,
+
+        leaseUntil:
+            generation.leaseUntil,
 
         streamSeq:
             generation.streamSeq,
@@ -679,26 +1683,145 @@ function compactGeneration(
     };
 }
 
+function publicState(
+    record,
+    {
+        includeSnapshot = true,
+    } = {},
+) {
+    return {
+        protocolVersion:
+            PROTOCOL_VERSION,
+
+        schemaVersion:
+            STATE_SCHEMA_VERSION,
+
+        epoch:
+            runtimeEpoch,
+
+        scope:
+            clone(record.scope),
+
+        revision:
+            record.revision,
+
+        seq:
+            record.seq,
+
+        lastEventId:
+            record.seq > 0
+                ? eventId(
+                    record.seq,
+                )
+                : null,
+
+        snapshot:
+            includeSnapshot &&
+            record.snapshot
+                ? clone(
+                    record.snapshot,
+                )
+                : null,
+
+        snapshotHash:
+            record.snapshotHash,
+
+        generation:
+            publicGeneration(
+                record.generation,
+            ),
+    };
+}
+
 
 /* -------------------------------------------------------------------------- */
-/* Events                                                                      */
+/* Operation idempotency                                                      */
 /* -------------------------------------------------------------------------- */
 
-function makeEvent(
+function rememberOperation(
+    record,
+    opId,
+    result,
+) {
+    if (!opId) {
+        return;
+    }
+
+    if (
+        !record.seenOps.includes(
+            opId,
+        )
+    ) {
+        record.seenOps.push(
+            opId,
+        );
+    }
+
+    record.opResults.set(
+        opId,
+        clone(result),
+    );
+
+    while (
+        record.seenOps.length >
+        MAX_OPERATION_HISTORY
+    ) {
+        const oldest =
+            record.seenOps.shift();
+
+        record.opResults.delete(
+            oldest,
+        );
+    }
+}
+
+function findOperation(
+    record,
+    opId,
+) {
+    if (
+        !opId ||
+        !record.seenOps.includes(
+            opId,
+        )
+    ) {
+        return null;
+    }
+
+    return clone(
+        record.opResults.get(
+            opId,
+        ) || {
+            duplicate:
+                true,
+            state:
+                publicState(
+                    record,
+                ),
+        },
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Replay event storage                                                       */
+/* -------------------------------------------------------------------------- */
+
+function appendEvent(
     record,
     {
         type,
         opId = null,
         sourceClientId = null,
         sourceDeviceId = null,
+        baseRevision = null,
         payload = {},
-        includeSnapshot = false,
         generation = null,
     },
 ) {
     record.seq += 1;
 
-    const event = {
+    const stored = {
         id:
             eventId(
                 record.seq,
@@ -712,6 +1835,8 @@ function makeEvent(
 
         revision:
             record.revision,
+
+        baseRevision,
 
         timestamp:
             now(),
@@ -729,101 +1854,228 @@ function makeEvent(
 
         generation:
             generation
-                ? compactGeneration(
+                ? publicGeneration(
                     generation,
                 )
                 : null,
     };
 
-    if (
-        includeSnapshot &&
-        record.snapshot
-    ) {
-        event.snapshot =
-            clone(
-                record.snapshot,
-            );
-    }
-
-    /*
-     * Streaming snapshots are delivered live but are deliberately not retained
-     * as full copies in the replay history. A replay through a stream event
-     * causes /state recovery instead.
-     */
-    const storedEvent =
-        event.type ===
-            'generation_stream'
-            ? {
-                ...event,
-                snapshot:
-                    undefined,
-            }
-            : event;
-
-    if (
-        storedEvent.snapshot ===
-            undefined
-    ) {
-        delete storedEvent.snapshot;
-    }
-
     record.events.push(
-        storedEvent,
+        stored,
     );
 
     if (
         record.events.length >
-        MAX_EVENTS
+        MAX_REPLAY_EVENTS
     ) {
-        record.events.splice(
-            0,
-            record.events.length -
-                MAX_EVENTS,
-        );
+        record.events =
+            record.events.slice(
+                -MAX_REPLAY_EVENTS,
+            );
     }
 
-    return event;
-}
-
-function rememberOp(
-    record,
-    opId,
-) {
-    if (!opId) {
-        return;
-    }
-
-    record.seenOps.push(
-        opId,
-    );
-
-    if (
-        record.seenOps.length >
-        MAX_SEEN_OPS
+    while (
+        record.events.length &&
+        byteLength(
+            record.events,
+        ) >
+            MAX_REPLAY_BYTES
     ) {
-        record.seenOps.splice(
-            0,
-            record.seenOps.length -
-                MAX_SEEN_OPS,
-        );
+        record.events.shift();
     }
-}
 
-function hasSeenOp(
-    record,
-    opId,
-) {
-    return Boolean(
-        opId &&
-        record.seenOps.includes(
-            opId,
-        ),
+    return clone(
+        stored,
     );
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* SSE                                                                          */
+/* Snapshot live patch generation                                             */
+/* -------------------------------------------------------------------------- */
+
+function makeSnapshotPatch(
+    previous,
+    next,
+) {
+    if (!previous) {
+        return {
+            kind:
+                'full',
+
+            snapshot:
+                clone(next),
+        };
+    }
+
+    const prevChat =
+        previous.chat || [];
+
+    const nextChat =
+        next.chat || [];
+
+    /*
+     * Append-only optimization.
+     */
+    if (
+        nextChat.length >
+        prevChat.length
+    ) {
+        let prefixMatches =
+            true;
+
+        for (
+            let i = 1;
+            i <
+                prevChat.length;
+            i++
+        ) {
+            if (
+                messageSyncId(
+                    prevChat[i],
+                ) !==
+                messageSyncId(
+                    nextChat[i],
+                )
+            ) {
+                prefixMatches =
+                    false;
+                break;
+            }
+        }
+
+        if (
+            prefixMatches
+        ) {
+            const appended =
+                nextChat
+                    .slice(
+                        prevChat.length,
+                    )
+                    .map(
+                        clone,
+                    );
+
+            return {
+                kind:
+                    'append',
+
+                startIndex:
+                    prevChat.length,
+
+                messages:
+                    appended,
+
+                chatMetadata:
+                    sameValue(
+                        previous.chatMetadata ||
+                            {},
+                        next.chatMetadata ||
+                            {},
+                    )
+                        ? null
+                        : clone(
+                            next.chatMetadata ||
+                                {},
+                        ),
+            };
+        }
+    }
+
+    /*
+     * If the number/order of stable message IDs changed, a full snapshot is
+     * the safest representation.
+     */
+    if (
+        prevChat.length !==
+        nextChat.length
+    ) {
+        return {
+            kind:
+                'full',
+
+            snapshot:
+                clone(next),
+        };
+    }
+
+    for (
+        let i = 1;
+        i <
+            prevChat.length;
+        i++
+    ) {
+        if (
+            messageSyncId(
+                prevChat[i],
+            ) !==
+            messageSyncId(
+                nextChat[i],
+            )
+        ) {
+            return {
+                kind:
+                    'full',
+
+                snapshot:
+                    clone(next),
+            };
+        }
+    }
+
+    const changes = [];
+
+    for (
+        let i = 1;
+        i <
+            nextChat.length;
+        i++
+    ) {
+        if (
+            !sameValue(
+                prevChat[i],
+                nextChat[i],
+            )
+        ) {
+            changes.push({
+                index:
+                    i,
+
+                message:
+                    clone(
+                        nextChat[i],
+                    ),
+            });
+        }
+    }
+
+    const metadataChanged =
+        !sameValue(
+            previous.chatMetadata ||
+                {},
+            next.chatMetadata ||
+                {},
+        );
+
+    return {
+        kind:
+            'patch',
+
+        changes,
+
+        chatMetadata:
+            metadataChanged
+                ? clone(
+                    next.chatMetadata ||
+                        {},
+                )
+                : null,
+    };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* SSE delivery                                                               */
 /* -------------------------------------------------------------------------- */
 
 function sendSse(
@@ -832,11 +2084,13 @@ function sendSse(
     data,
     id = null,
 ) {
-    if (res.writableEnded) {
+    if (
+        res.writableEnded
+    ) {
         return;
     }
 
-    if (id !== null) {
+    if (id) {
         res.write(
             `id: ${id}\n`,
         );
@@ -848,13 +2102,14 @@ function sendSse(
         );
     }
 
-    const text =
+    const encoded =
         JSON.stringify(
             data,
         );
 
     for (
-        const line of text.split('\n')
+        const line of
+            encoded.split('\n')
     ) {
         res.write(
             `data: ${line}\n`,
@@ -864,72 +2119,138 @@ function sendSse(
     res.write('\n');
 }
 
-function broadcast(
+function addSseClient(
     record,
-    event,
+    clientId,
+    response,
 ) {
-    const clients =
-        sseByScope.get(
+    let clientMap =
+        sseClients.get(
             record.key,
         );
 
+    if (!clientMap) {
+        clientMap =
+            new Map();
+
+        sseClients.set(
+            record.key,
+            clientMap,
+        );
+    }
+
+    let responseSet =
+        clientMap.get(
+            clientId,
+        );
+
+    if (!responseSet) {
+        responseSet =
+            new Set();
+
+        clientMap.set(
+            clientId,
+            responseSet,
+        );
+    }
+
     if (
-        !clients ||
-        clients.size === 0
+        responseSet.size >=
+        MAX_SSE_PER_CLIENT
     ) {
+        throw new SyncError(
+            'sse_limit',
+            'Too many SSE connections',
+            429,
+        );
+    }
+
+    responseSet.add(
+        response,
+    );
+
+    return () => {
+        responseSet.delete(
+            response,
+        );
+
+        if (
+            responseSet.size ===
+            0
+        ) {
+            clientMap.delete(
+                clientId,
+            );
+        }
+
+        if (
+            clientMap.size ===
+            0
+        ) {
+            sseClients.delete(
+                record.key,
+            );
+        }
+    };
+}
+
+function broadcastLiveEvent(
+    record,
+    event,
+    patch,
+) {
+    const clients =
+        sseClients.get(
+            record.key,
+        );
+
+    if (!clients) {
         return;
     }
 
-    const data = {
+    const state =
+        publicState(
+            record,
+            {
+                includeSnapshot:
+                    false,
+            },
+        );
+
+    const envelope = {
         ...clone(event),
 
-        state: {
-            epoch:
-                runtimeEpoch,
+        state,
 
-            revision:
-                record.revision,
-
-            seq:
-                record.seq,
-
-            snapshotHash:
-                record.snapshotHash,
-
-            generation:
-                record.generation
-                    ? compactGeneration(
-                        record.generation,
-                    )
-                    : null,
-        },
+        patch:
+            patch
+                ? clone(
+                    patch,
+                )
+                : null,
     };
 
-    /*
-     * Live delivery always carries the latest authoritative snapshot.
-     */
-    data.snapshot =
-        record.snapshot
-            ? clone(
-                record.snapshot,
-            )
-            : null;
-
     for (
-        const res of clients
+        const responseSet of
+            clients.values()
     ) {
-        try {
-            sendSse(
-                res,
-                'sync',
-                data,
-                event.id,
-            );
-        } catch {
+        for (
+            const res of
+                responseSet
+        ) {
             try {
-                res.end();
+                sendSse(
+                    res,
+                    'sync',
+                    envelope,
+                    event.id,
+                );
             } catch {
-                // ignored
+                try {
+                    res.end();
+                } catch {
+                    // ignored
+                }
             }
         }
     }
@@ -937,29 +2258,525 @@ function broadcast(
 
 
 /* -------------------------------------------------------------------------- */
-/* Persistence                                                                  */
+/* Subscription token                                                         */
 /* -------------------------------------------------------------------------- */
 
-async function atomicWrite(
-    file,
-    data,
+function issueSubscriptionToken(
+    userId,
+    scope,
+    clientId,
+    deviceId,
 ) {
-    const temp =
-        `${file}.${process.pid}.${Date.now()}.tmp`;
+    const payload = {
+        v:
+            PROTOCOL_VERSION,
 
-    await fs.writeFile(
-        temp,
-        data,
-        'utf8',
+        user:
+            userId,
+
+        scope:
+            scopeKey(
+                userId,
+                scope,
+            ),
+
+        clientId,
+
+        deviceId,
+
+        exp:
+            now() +
+            SUBSCRIPTION_TOKEN_TTL_MS,
+
+        nonce:
+            randomId(),
+    };
+
+    const body =
+        base64urlEncode(
+            JSON.stringify(
+                payload,
+            ),
+        );
+
+    const signature =
+        hmac(
+            `sub:${body}`,
+        );
+
+    return `${body}.${signature}`;
+}
+
+function verifySubscriptionToken(
+    token,
+) {
+    if (
+        typeof token !==
+            'string' ||
+        !token.includes('.')
+    ) {
+        throw new SyncError(
+            'invalid_subscription',
+            'Invalid SSE subscription',
+            403,
+        );
+    }
+
+    const [
+        body,
+        suppliedSignature,
+    ] =
+        token.split(
+            '.',
+        );
+
+    const expectedSignature =
+        hmac(
+            `sub:${body}`,
+        );
+
+    const left =
+        Buffer.from(
+            suppliedSignature,
+        );
+
+    const right =
+        Buffer.from(
+            expectedSignature,
+        );
+
+    if (
+        left.length !==
+            right.length ||
+        !crypto.timingSafeEqual(
+            left,
+            right,
+        )
+    ) {
+        throw new SyncError(
+            'invalid_subscription',
+            'Invalid SSE subscription',
+            403,
+        );
+    }
+
+    let parsed;
+
+    try {
+        parsed =
+            JSON.parse(
+                base64urlDecode(
+                    body,
+                ),
+            );
+    } catch {
+        throw new SyncError(
+            'invalid_subscription',
+            'Invalid SSE subscription',
+            403,
+        );
+    }
+
+    if (
+        parsed.v !==
+        PROTOCOL_VERSION ||
+        parsed.exp <=
+            now()
+    ) {
+        throw new SyncError(
+            'subscription_expired',
+            'SSE subscription expired',
+            403,
+        );
+    }
+
+    return parsed;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Rate limiting                                                              */
+/* -------------------------------------------------------------------------- */
+
+function consumeRate(
+    userId,
+    category,
+) {
+    const limit =
+        RATE_LIMITS[
+            category
+        ] ??
+        RATE_LIMITS.read;
+
+    const key =
+        `${userId}:${category}`;
+
+    let bucket =
+        rateBuckets.get(
+            key,
+        );
+
+    const timestamp =
+        now();
+
+    if (
+        !bucket ||
+        timestamp -
+            bucket.startedAt >=
+            RATE_WINDOW_MS
+    ) {
+        bucket = {
+            startedAt:
+                timestamp,
+
+            count:
+                0,
+        };
+
+        rateBuckets.set(
+            key,
+            bucket,
+        );
+    }
+
+    bucket.count +=
+        1;
+
+    if (
+        bucket.count >
+        limit
+    ) {
+        throw new SyncError(
+            'rate_limited',
+            'Too many synchronization requests',
+            429,
+        );
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Membership                                                                  */
+/* -------------------------------------------------------------------------- */
+
+function requireMember(
+    record,
+    clientId,
+    deviceId,
+) {
+    const member =
+        record.members.get(
+            clientId,
+        );
+
+    if (!member) {
+        throw new SyncError(
+            'not_member',
+            'Client has not joined this synchronization scope',
+            403,
+        );
+    }
+
+    if (
+        member.deviceId !==
+        deviceId
+    ) {
+        throw new SyncError(
+            'device_mismatch',
+            'Client/device identity mismatch',
+            409,
+        );
+    }
+
+    if (
+        member.expiresAt <=
+        now()
+    ) {
+        record.members.delete(
+            clientId,
+        );
+
+        throw new SyncError(
+            'membership_expired',
+            'Synchronization membership expired',
+            403,
+        );
+    }
+
+    member.lastSeen =
+        now();
+
+    member.expiresAt =
+        now() +
+        MEMBER_TTL_MS;
+
+    record.lastAccessAt =
+        now();
+
+    return member;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Generation expiry                                                          */
+/* -------------------------------------------------------------------------- */
+
+function abandonGeneration(
+    record,
+    reason,
+) {
+    const generation =
+        record.generation;
+
+    if (!generation) {
+        return;
+    }
+
+    const previousRevision =
+        record.revision;
+
+    generation.state =
+        'abandoned';
+
+    generation.leaseUntil =
+        0;
+
+    record.revision +=
+        1;
+
+    const event =
+        appendEvent(
+            record,
+            {
+                type:
+                    'generation_abandoned',
+
+                opId:
+                    null,
+
+                sourceClientId:
+                    generation.ownerClientId,
+
+                sourceDeviceId:
+                    generation.ownerDeviceId,
+
+                baseRevision:
+                    previousRevision,
+
+                payload: {
+                    generationId:
+                        generation.id,
+
+                    reason,
+                },
+
+                generation,
+            },
+        );
+
+    record.generation =
+        null;
+
+    rememberOperation(
+        record,
+        randomId(),
+        {
+            state:
+                publicState(
+                    record,
+                ),
+        },
     );
 
-    await fs.rename(
-        temp,
-        file,
+    broadcastLiveEvent(
+        record,
+        event,
+        null,
+    );
+
+    void persistScope(
+        record,
+        true,
     );
 }
 
-function persistentView(
+function checkGenerationLease(
+    record,
+) {
+    const generation =
+        record.generation;
+
+    if (!generation) {
+        return;
+    }
+
+    const timestamp =
+        now();
+
+    if (
+        timestamp -
+            generation.startedAt >
+        GENERATION_MAX_MS
+    ) {
+        abandonGeneration(
+            record,
+            'maximum_generation_lifetime',
+        );
+
+        return;
+    }
+
+    if (
+        generation.leaseUntil <=
+        timestamp
+    ) {
+        abandonGeneration(
+            record,
+            'lease_expired',
+        );
+
+        return;
+    }
+
+    if (
+        !record.members.has(
+            generation.ownerClientId,
+        )
+    ) {
+        abandonGeneration(
+            record,
+            'owner_membership_lost',
+        );
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Revision helpers                                                           */
+/* -------------------------------------------------------------------------- */
+
+function requireBaseRevision(
+    record,
+    baseRevision,
+) {
+    const numeric =
+        Number(
+            baseRevision,
+        );
+
+    if (
+        !Number.isSafeInteger(
+            numeric,
+        ) ||
+        numeric < 0
+    ) {
+        throw new SyncError(
+            'invalid_revision',
+            'Invalid base revision',
+        );
+    }
+
+    if (
+        numeric !==
+        record.revision
+    ) {
+        throw new SyncError(
+            'stale_revision',
+            'Client state is stale',
+            409,
+            {
+                state:
+                    publicState(
+                        record,
+                    ),
+            },
+        );
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Persistence                                                                */
+/* -------------------------------------------------------------------------- */
+
+function getRecordFilePath(
+    record,
+) {
+    return path.join(
+        stateRoot,
+        `${safeStorageHash(
+            record.key,
+        )}.json`,
+    );
+}
+
+async function ensurePersistenceRoot() {
+    dataRoot =
+        path.resolve(
+            globalThis.DATA_ROOT ||
+                path.join(
+                    process.cwd(),
+                    'data',
+                ),
+        );
+
+    pluginRoot =
+        path.join(
+            dataRoot,
+            DATA_DIR_NAME,
+        );
+
+    stateRoot =
+        path.join(
+            pluginRoot,
+            STATE_DIR_NAME,
+        );
+
+    secretPath =
+        path.join(
+            pluginRoot,
+            SECRET_FILE_NAME,
+        );
+
+    await fsp.mkdir(
+        stateRoot,
+        {
+            recursive:
+                true,
+        },
+    );
+
+    try {
+        principalSecret =
+            await fsp.readFile(
+                secretPath,
+            );
+    } catch {
+        principalSecret =
+            crypto.randomBytes(
+                32,
+            );
+
+        const temp =
+            `${secretPath}.${process.pid}.tmp`;
+
+        await fsp.writeFile(
+            temp,
+            principalSecret,
+            {
+                mode:
+                    0o600,
+            },
+        );
+
+        await fsp.rename(
+            temp,
+            secretPath,
+        );
+    }
+}
+
+function persistedRepresentation(
     record,
 ) {
     return {
@@ -993,563 +2810,642 @@ function persistentView(
         seenOps:
             record.seenOps,
 
-        generation:
-            record.generation
-                ? compactGeneration(
-                    record.generation,
-                )
-                : null,
+        opResults:
+            Object.fromEntries(
+                record.opResults
+                    .entries(),
+            ),
 
-        persistedAt:
-            now(),
+        lastAccessAt:
+            record.lastAccessAt,
+
+        persistedRevision:
+            record.persistedRevision,
     };
 }
 
-async function persistScope(
-    record,
-) {
-    try {
-        await fs.mkdir(
-            persistDir,
-            {
-                recursive:
-                    true,
-            },
-        );
+function rebuildPersistedBytesByUser() {
+    persistedBytesByUser.clear();
 
-        const file =
-            path.join(
-                persistDir,
-                `${scopeHash(record.key)}.json`,
-            );
+    for (
+        const record of
+            scopes.values()
+    ) {
+        const previous =
+            persistedBytesByUser.get(
+                record.userId,
+            ) || 0;
 
-        await atomicWrite(
-            file,
-            JSON.stringify(
-                persistentView(
-                    record,
-                ),
-            ),
-        );
-
-        record.persistVersion += 1;
-    } catch (error) {
-        console.error(
-            `[${PLUGIN_ID}] persistence failed for scope`,
-            record.key,
-            error,
+        persistedBytesByUser.set(
+            record.userId,
+            previous +
+                record.persistedBytes,
         );
     }
 }
 
-function schedulePersist(
+async function writeScopeNow(
     record,
-    immediate = false,
 ) {
-    if (immediate) {
-        const current =
-            persistTimers.get(
-                record.key,
-            );
-
-        if (current) {
-            clearTimeout(
-                current,
-            );
-        }
-
-        persistTimers.delete(
-            record.key,
-        );
-
-        return persistScope(
-            record,
-        );
-    }
-
     if (
-        persistTimers.has(
-            record.key,
-        )
+        !stateRoot
     ) {
         return;
     }
 
-    const timer =
-        setTimeout(
-            () => {
-                persistTimers.delete(
-                    record.key,
-                );
+    const serialized =
+        JSON.stringify(
+            persistedRepresentation(
+                record,
+            ),
+        );
 
-                void persistScope(
+    const newBytes =
+        Buffer.byteLength(
+            serialized,
+            'utf8',
+        );
+
+    const currentUserBytes =
+        persistedBytesByUser.get(
+            record.userId,
+        ) || 0;
+
+    const proposed =
+        currentUserBytes -
+        record.persistedBytes +
+        newBytes;
+
+    if (
+        proposed >
+        MAX_PERSISTED_BYTES_PER_USER
+    ) {
+        throw new SyncError(
+            'storage_quota',
+            'Synchronization mirror storage quota exceeded',
+            507,
+        );
+    }
+
+    const filePath =
+        getRecordFilePath(
+            record,
+        );
+
+    const tempPath =
+        `${filePath}.${process.pid}.tmp`;
+
+    await fsp.writeFile(
+        tempPath,
+        serialized,
+        {
+            encoding:
+                'utf8',
+
+            mode:
+                0o600,
+        },
+    );
+
+    await fsp.rename(
+        tempPath,
+        filePath,
+    );
+
+    persistedBytesByUser.set(
+        record.userId,
+        proposed,
+    );
+
+    record.persistedBytes =
+        newBytes;
+
+    record.persistedRevision =
+        record.revision;
+}
+
+function persistScope(
+    record,
+    immediate = false,
+) {
+    record.persistChain =
+        record.persistChain.then(
+            async () => {
+                if (
+                    !immediate &&
+                    record.persistedRevision ===
+                        record.revision
+                ) {
+                    return;
+                }
+
+                await writeScopeNow(
                     record,
                 );
             },
-            PERSIST_DEBOUNCE_MS,
-        );
+        ).catch(
+            error => {
+                console.error(
+                    `[${PLUGIN_ID}] persistence failure for scope`,
+                    record.key,
+                    error,
+                );
 
-    persistTimers.set(
-        record.key,
-        timer,
-    );
-}
-
-async function loadPersisted() {
-    try {
-        await fs.mkdir(
-            persistDir,
-            {
-                recursive:
-                    true,
+                throw error;
             },
         );
 
-        const files =
-            await fs.readdir(
-                persistDir,
+    return record.persistChain;
+}
+
+async function loadPersistedState() {
+    const files =
+        await fsp.readdir(
+            stateRoot,
+        );
+
+    for (
+        const filename of
+            files
+    ) {
+        if (
+            !filename.endsWith(
+                '.json',
+            )
+        ) {
+            continue;
+        }
+
+        const filePath =
+            path.join(
+                stateRoot,
+                filename,
             );
 
-        for (
-            const fileName of files
-        ) {
+        try {
+            const raw =
+                await fsp.readFile(
+                    filePath,
+                    'utf8',
+                );
+
+            const parsed =
+                JSON.parse(
+                    raw,
+                );
+
             if (
-                !fileName.endsWith(
-                    '.json',
-                )
+                parsed?.schemaVersion !==
+                    STATE_SCHEMA_VERSION ||
+                typeof parsed?.key !==
+                    'string' ||
+                typeof parsed?.userId !==
+                    'string' ||
+                !parsed?.scope
             ) {
                 continue;
             }
 
-            const file =
-                path.join(
-                    persistDir,
-                    fileName,
+            const scope =
+                normalizeScope(
+                    parsed.scope,
                 );
 
+            const record =
+                createScopeRecord(
+                    parsed.key,
+                    parsed.userId,
+                    scope,
+                );
+
+            record.revision =
+                Number.isSafeInteger(
+                    parsed.revision,
+                )
+                    ? parsed.revision
+                    : 0;
+
+            record.seq =
+                Number.isSafeInteger(
+                    parsed.seq,
+                )
+                    ? parsed.seq
+                    : 0;
+
+            record.snapshot =
+                parsed.snapshot
+                    ? clone(
+                        parsed.snapshot,
+                    )
+                    : null;
+
+            record.snapshotHash =
+                typeof parsed.snapshotHash ===
+                    'string'
+                    ? parsed.snapshotHash
+                    : record.snapshot
+                        ? sha256(
+                            record.snapshot,
+                        )
+                        : null;
+
+            record.events =
+                Array.isArray(
+                    parsed.events,
+                )
+                    ? parsed.events
+                        .slice(
+                            -MAX_REPLAY_EVENTS,
+                        )
+                        .map(
+                            clone,
+                        )
+                    : [];
+
+            record.seenOps =
+                Array.isArray(
+                    parsed.seenOps,
+                )
+                    ? parsed.seenOps
+                        .slice(
+                            -MAX_OPERATION_HISTORY,
+                        )
+                    : [];
+
+            record.opResults =
+                new Map(
+                    Object.entries(
+                        parsed.opResults ||
+                            {},
+                    ),
+                );
+
+            record.lastAccessAt =
+                Number.isFinite(
+                    parsed.lastAccessAt,
+                )
+                    ? parsed.lastAccessAt
+                    : now();
+
             try {
-                const parsed =
-                    JSON.parse(
-                        await fs.readFile(
-                            file,
-                            'utf8',
-                        ),
+                const stat =
+                    await fsp.stat(
+                        filePath,
                     );
 
-                if (
-                    parsed?.schemaVersion !==
-                        STATE_SCHEMA_VERSION ||
-                    !parsed?.key ||
-                    !parsed?.scope ||
-                    !parsed?.userId
-                ) {
-                    continue;
-                }
+                record.persistedBytes =
+                    stat.size;
+            } catch {
+                record.persistedBytes =
+                    0;
+            }
 
-                const record =
-                    ensureScopeRecord(
-                        parsed.key,
-                        parsed.userId,
-                        parsed.scope,
-                    );
+            record.persistedRevision =
+                Number.isSafeInteger(
+                    parsed.persistedRevision,
+                )
+                    ? parsed.persistedRevision
+                    : record.revision;
 
-                record.revision =
-                    Number.isSafeInteger(
-                        parsed.revision,
-                    )
-                        ? parsed.revision
-                        : 0;
+            /*
+             * Never restore active generation ownership across server restart.
+             * The new server epoch fences every previous owner.
+             */
+            record.generation =
+                null;
+        } catch (error) {
+            console.warn(
+                `[${PLUGIN_ID}] Ignoring invalid persisted state ${filename}:`,
+                error?.message ||
+                    error,
+            );
+        }
+    }
 
-                record.seq =
-                    Number.isSafeInteger(
-                        parsed.seq,
-                    )
-                        ? parsed.seq
-                        : 0;
+    rebuildPersistedBytesByUser();
+}
 
-                record.snapshot =
-                    parsed.snapshot
-                        ? clone(
-                            parsed.snapshot,
-                        )
-                        : null;
 
-                record.snapshotHash =
-                    typeof parsed.snapshotHash ===
-                        'string'
-                        ? parsed.snapshotHash
-                        : null;
+/* -------------------------------------------------------------------------- */
+/* Liveness / memory cleanup                                                  */
+/* -------------------------------------------------------------------------- */
 
-                record.events =
-                    Array.isArray(
-                        parsed.events,
-                    )
-                        ? parsed.events
-                            .slice(
-                                -MAX_EVENTS,
-                            )
-                            .map(clone)
-                        : [];
+function cleanRuntimeState() {
+    const timestamp =
+        now();
 
-                record.seenOps =
-                    Array.isArray(
-                        parsed.seenOps,
-                    )
-                        ? parsed.seenOps
-                            .slice(
-                                -MAX_SEEN_OPS,
-                            )
-                        : [];
-
-                record.generation =
-                    parsed.generation
-                        ? clone(
-                            parsed.generation,
-                        )
-                        : null;
-
-                /*
-                 * Never restore generation ownership from a previous runtime.
-                 * Server epoch changed, therefore prior ownership is fenced out.
-                 */
-                if (
-                    record.generation
-                ) {
-                    record.generation.state =
-                        'abandoned';
-
-                    record.generation.leaseUntil =
-                        0;
-                }
-
-                record.serverEpoch =
-                    runtimeEpoch;
-            } catch (error) {
-                console.warn(
-                    `[${PLUGIN_ID}] ignoring unreadable persisted scope ${fileName}`,
-                    error?.message ||
-                        error,
+    for (
+        const record of
+            scopes.values()
+    ) {
+        for (
+            const [
+                clientId,
+                member,
+            ] of record.members
+        ) {
+            if (
+                member.expiresAt <=
+                timestamp
+            ) {
+                record.members.delete(
+                    clientId,
                 );
             }
         }
-    } catch (error) {
-        console.warn(
-            `[${PLUGIN_ID}] persistent state unavailable; running memory-only`,
-            error?.message ||
-                error,
-        );
-    }
-}
 
-
-/* -------------------------------------------------------------------------- */
-/* Membership                                                                   */
-/* -------------------------------------------------------------------------- */
-
-function requireMember(
-    record,
-    clientId,
-) {
-    const member =
-        record.members.get(
-            clientId,
-        );
-
-    if (!member) {
-        const error =
-            new Error(
-                'Client is not a member of this sync scope',
+        if (
+            record.generation
+        ) {
+            checkGenerationLease(
+                record,
             );
-
-        error.code =
-            'not_member';
-
-        throw error;
-    }
-
-    if (
-        member.expiresAt <=
-        now()
-    ) {
-        record.members.delete(
-            clientId,
-        );
-
-        const error =
-            new Error(
-                'Client membership expired',
-            );
-
-        error.code =
-            'membership_expired';
-
-        throw error;
-    }
-
-    member.lastSeen =
-        now();
-
-    member.expiresAt =
-        now() +
-        MEMBER_TTL_MS;
-
-    return member;
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Generation expiry                                                            */
-/* -------------------------------------------------------------------------- */
-
-function expireGeneration(
-    record,
-) {
-    const generation =
-        record.generation;
-
-    if (!generation) {
-        return null;
-    }
-
-    if (
-        generation.leaseUntil >
-        now()
-    ) {
-        return null;
-    }
-
-    generation.state =
-        'abandoned';
-
-    /*
-     * Increment revision before making the event so the event advertises the
-     * authoritative new revision.
-     */
-    record.revision += 1;
-
-    const event =
-        makeEvent(
-            record,
-            {
-                type:
-                    'generation_abandoned',
-
-                sourceClientId:
-                    generation.ownerClientId,
-
-                sourceDeviceId:
-                    generation.ownerDeviceId,
-
-                payload: {
-                    reason:
-                        'lease_expired',
-
-                    generationId:
-                        generation.id,
-                },
-
-                generation:
-                    generation,
-            },
-        );
-
-    event.revision =
-        record.revision;
-
-    record.generation =
-        null;
-
-    broadcast(
-        record,
-        event,
-    );
-
-    void schedulePersist(
-        record,
-        true,
-    );
-
-    return event;
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Request parsing                                                              */
-/* -------------------------------------------------------------------------- */
-
-function scopeFromRequest(
-    req,
-) {
-    let raw =
-        req.body?.scope;
-
-    if (
-        !raw &&
-        req.query?.scope
-    ) {
-        try {
-            raw =
-                JSON.parse(
-                    String(
-                        req.query.scope,
-                    ),
-                );
-        } catch {
-            raw =
-                null;
         }
     }
 
-    return normalizeScope(
-        raw,
-    );
-}
-
-function clientEnvelope(
-    req,
-) {
-    const body =
-        req.body || {};
-
-    const clientId =
-        validateId(
-            body.clientId,
-            'clientId',
-            256,
-        );
-
-    const deviceId =
-        validateId(
-            body.deviceId,
-            'deviceId',
-            256,
-        );
-
-    const protocolVersion =
-        Number(
-            body.protocolVersion,
-        );
-
     if (
-        protocolVersion !==
-        PROTOCOL_VERSION
+        scopes.size >
+        MAX_SCOPES_IN_MEMORY
     ) {
-        const error =
-            new Error(
-                `Protocol version ${protocolVersion} is not supported; expected ${PROTOCOL_VERSION}`,
+        const candidates =
+            [
+                ...scopes.values(),
+            ]
+                .filter(
+                    record =>
+                        record.members.size ===
+                            0 &&
+                        !record.generation &&
+                        timestamp -
+                            record.lastAccessAt >
+                            SCOPE_MEMORY_IDLE_MS,
+                )
+                .sort(
+                    (
+                        a,
+                        b,
+                    ) =>
+                        a.lastAccessAt -
+                        b.lastAccessAt,
+                );
+
+        while (
+            scopes.size >
+                MAX_SCOPES_IN_MEMORY &&
+            candidates.length
+        ) {
+            const record =
+                candidates.shift();
+
+            scopes.delete(
+                record.key,
             );
-
-        error.code =
-            'protocol_mismatch';
-
-        throw error;
+        }
     }
 
-    return {
-        clientId,
-        deviceId,
-        body,
-    };
-}
-
-function checkBaseRevision(
-    record,
-    body,
-) {
-    const baseRevision =
-        Number(
-            body.baseRevision,
-        );
-
-    if (
-        !Number.isSafeInteger(
-            baseRevision,
-        ) ||
-        baseRevision < 0
+    for (
+        const [
+            key,
+            bucket,
+        ] of rateBuckets
     ) {
-        const error =
-            new Error(
-                'Invalid baseRevision',
+        if (
+            timestamp -
+                bucket.startedAt >
+            RATE_WINDOW_MS * 2
+        ) {
+            rateBuckets.delete(
+                key,
             );
-
-        error.code =
-            'invalid_revision';
-
-        throw error;
+        }
     }
 
-    if (
-        baseRevision !==
-        record.revision
+    for (
+        const [
+            key,
+            cached,
+        ] of groupCache
     ) {
-        const error =
-            new Error(
-                'Client revision is stale',
+        if (
+            timestamp -
+                cached.at >
+            GROUP_CACHE_MS * 10
+        ) {
+            groupCache.delete(
+                key,
             );
+        }
+    }
 
-        error.code =
-            'stale_revision';
-
-        error.currentState =
-            publicState(
-                record,
+    for (
+        const [
+            key,
+            cached,
+        ] of chatFileCache
+    ) {
+        if (
+            timestamp -
+                cached.cachedAt >
+            60_000
+        ) {
+            chatFileCache.delete(
+                key,
             );
-
-        throw error;
+        }
     }
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Plugin init                                                                  */
+/* Error response                                                             */
+/* -------------------------------------------------------------------------- */
+
+function sendError(
+    res,
+    error,
+) {
+    const syncError =
+        error instanceof SyncError
+            ? error
+            : new SyncError(
+                'internal_error',
+                'Synchronization request failed',
+                500,
+            );
+
+    const body = {
+        ok:
+            false,
+
+        code:
+            syncError.code,
+
+        message:
+            syncError.message,
+    };
+
+    if (
+        syncError.state
+    ) {
+        body.state =
+            syncError.state;
+    }
+
+    if (
+        syncError.expectedHash
+    ) {
+        body.expectedHash =
+            syncError.expectedHash;
+    }
+
+    if (
+        syncError.actualHash
+    ) {
+        body.actualHash =
+            syncError.actualHash;
+    }
+
+    return res
+        .status(
+            syncError.status,
+        )
+        .json(
+            body,
+        );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Initialization                                                             */
 /* -------------------------------------------------------------------------- */
 
 async function init(
     router,
 ) {
+    if (
+        initialized
+    ) {
+        return;
+    }
+
+    shuttingDown =
+        false;
+
     /*
-     * Route-level body size guard.
-     *
-     * ST generally parses API bodies globally, so the actual snapshot/event
-     * is also size-validated below.
+     * If persistence setup fails, the plugin remains available as a memory-only
+     * synchronization server rather than throwing and risking the host.
      */
-    router.use(
-        (
-            req,
-            res,
-            next,
-        ) => {
-            const length =
-                Number(
-                    req.headers[
-                        'content-length'
-                    ],
-                );
+    try {
+        await ensurePersistenceRoot();
+        await loadPersistedState();
+    } catch (error) {
+        console.error(
+            `[${PLUGIN_ID}] durable mirror unavailable; continuing memory-only:`,
+            error,
+        );
 
-            if (
-                Number.isFinite(length) &&
-                length >
-                    MAX_EVENT_BYTES
-            ) {
-                return httpError(
-                    res,
-                    413,
-                    'payload_too_large',
-                    'Request body exceeds sync limit',
-                );
-            }
+        dataRoot =
+            path.resolve(
+                globalThis.DATA_ROOT ||
+                    path.join(
+                        process.cwd(),
+                        'data',
+                    ),
+            );
 
-            noStore(res);
+        pluginRoot =
+            path.join(
+                dataRoot,
+                DATA_DIR_NAME,
+            );
 
-            return next();
-        },
-    );
+        stateRoot =
+            path.join(
+                pluginRoot,
+                STATE_DIR_NAME,
+            );
 
-    await loadPersisted();
+        principalSecret =
+            crypto.randomBytes(
+                32,
+            );
+    }
 
 
     /* ---------------------------------------------------------------------- */
-    /* Health                                                                  */
+    /* Common middleware                                                       */
+    /* ---------------------------------------------------------------------- */
+
+    router.use(
+        (req, res, next) => {
+            try {
+                /*
+                 * ST's current server puts req.user and global CSRF protection
+                 * in front of private API routes. We still enforce the user
+                 * check here so the plugin never trusts routing order alone.
+                 */
+                const userId =
+                    getAuthenticatedUserId(
+                        req,
+                    );
+
+                req.mcsUserId =
+                    userId;
+
+                consumeRate(
+                    userId,
+                    req.method ===
+                        'GET'
+                        ? 'read'
+                        : 'mutate',
+                );
+
+                const bodySize =
+                    req.body &&
+                    typeof req.body ===
+                        'object'
+                        ? byteLength(
+                            req.body,
+                        )
+                        : 0;
+
+                if (
+                    bodySize >
+                    MAX_REQUEST_BYTES
+                ) {
+                    throw new SyncError(
+                        'payload_too_large',
+                        'Request exceeds synchronization payload limit',
+                        413,
+                    );
+                }
+
+                if (
+                    req.body
+                ) {
+                    validateDataTree(
+                        req.body,
+                    );
+                }
+
+                res.setHeader(
+                    'Cache-Control',
+                    'no-store',
+                );
+
+                next();
+            } catch (error) {
+                return sendError(
+                    res,
+                    error,
+                );
+            }
+        },
+    );
+
+
+    /* ---------------------------------------------------------------------- */
+    /* HEALTH                                                                  */
     /* ---------------------------------------------------------------------- */
 
     router.get(
@@ -1558,54 +3454,75 @@ async function init(
             req,
             res,
         ) => {
-            const members =
-                [...scopes.values()]
-                    .reduce(
-                        (
-                            sum,
-                            record,
-                        ) =>
-                            sum +
-                            record.members.size,
-                        0,
-                    );
+            try {
+                return res.json({
+                    ok:
+                        true,
 
-            const activeGenerations =
-                [...scopes.values()]
-                    .filter(
-                        record =>
-                            record.generation &&
-                            record.generation.leaseUntil >
-                                now(),
-                    )
-                    .length;
-
-            return ok(
-                res,
-                {
                     plugin:
                         PLUGIN_ID,
 
                     protocolVersion:
                         PROTOCOL_VERSION,
 
+                    schemaVersion:
+                        STATE_SCHEMA_VERSION,
+
+                    userKey:
+                        makePrincipalKey(
+                            req.mcsUserId,
+                        ),
+
                     epoch:
                         runtimeEpoch,
 
-                    scopes:
-                        scopes.size,
+                    capabilities: {
+                        revisions:
+                            true,
 
-                    members,
+                        idempotency:
+                            true,
 
-                    activeGenerations,
-                },
-            );
+                        replay:
+                            true,
+
+                        sse:
+                            true,
+
+                        generationLease:
+                            true,
+
+                        generationStop:
+                            true,
+
+                        messageStableIds:
+                            true,
+
+                        branchLineage:
+                            true,
+
+                        durableMirror:
+                            true,
+
+                        stFileVerification:
+                            true,
+
+                        snapshotPatches:
+                            true,
+                    },
+                });
+            } catch (error) {
+                return sendError(
+                    res,
+                    error,
+                );
+            }
         },
     );
 
 
     /* ---------------------------------------------------------------------- */
-    /* Join                                                                    */
+    /* JOIN                                                                    */
     /* ---------------------------------------------------------------------- */
 
     router.post(
@@ -1616,21 +3533,25 @@ async function init(
         ) => {
             try {
                 const userId =
-                    userIdFromRequest(
-                        req,
-                    );
+                    req.mcsUserId;
 
                 const scope =
                     normalizeScope(
                         req.body?.scope,
                     );
 
-                const {
-                    clientId,
-                    deviceId,
-                } =
-                    clientEnvelope(
-                        req,
+                const clientId =
+                    normalizeString(
+                        req.body?.clientId,
+                        'clientId',
+                        256,
+                    );
+
+                const deviceId =
+                    normalizeString(
+                        req.body?.deviceId,
+                        'deviceId',
+                        256,
                     );
 
                 const key =
@@ -1639,43 +3560,150 @@ async function init(
                         scope,
                     );
 
-                const record =
-                    ensureScopeRecord(
+                let record =
+                    scopes.get(
                         key,
-                        userId,
+                    );
+
+                if (!record) {
+                    record =
+                        createScopeRecord(
+                            key,
+                            userId,
+                            scope,
+                        );
+                }
+
+                if (
+                    !record.members.has(
+                        clientId,
+                    ) &&
+                    record.members.size >=
+                        MAX_CLIENTS_PER_SCOPE
+                ) {
+                    throw new SyncError(
+                        'scope_client_limit',
+                        'Too many connected clients for this chat',
+                        429,
+                    );
+                }
+
+                const actual =
+                    await readStChatSnapshot(
+                        req,
+                        scope,
+                        {
+                            force:
+                                true,
+                        },
+                    );
+
+                /*
+                 * First connection initializes the server mirror from the
+                 * actual ST file whenever that file exists.
+                 */
+                if (
+                    record.revision ===
+                        0 &&
+                    !record.snapshot &&
+                    actual.snapshot
+                ) {
+                    validateSnapshotLineage(
+                        actual.snapshot,
                         scope,
                     );
 
-                expireGeneration(
-                    record,
-                );
+                    record.snapshot =
+                        clone(
+                            actual.snapshot,
+                        );
 
-                const existing =
+                    record.snapshotHash =
+                        actual.hash;
+
+                    record.lastAccessAt =
+                        now();
+
+                    await persistScope(
+                        record,
+                        true,
+                    );
+                } else if (
+                    record.snapshot &&
+                    actual.snapshot &&
+                    record.snapshotHash !==
+                        actual.hash &&
+                    sameIgnoringSyncIds(
+                        record.snapshot,
+                        actual.snapshot,
+                    )
+                ) {
+                    /*
+                     * Automatic legacy message-ID migration. The actual ST file
+                     * is accepted as the newer canonical representation because
+                     * the only semantic difference is our own sync metadata.
+                     */
+                    const previousRevision =
+                        record.revision;
+
+                    record.snapshot =
+                        clone(
+                            actual.snapshot,
+                        );
+
+                    record.snapshotHash =
+                        actual.hash;
+
+                    record.revision =
+                        previousRevision +
+                        1;
+
+                    const migrationEvent =
+                        appendEvent(
+                            record,
+                            {
+                                type:
+                                    'message_id_migration',
+
+                                baseRevision:
+                                    previousRevision,
+
+                                payload: {
+                                    reason:
+                                        'sync-id-normalization',
+                                },
+                            },
+                        );
+
+                    await persistScope(
+                        record,
+                        true,
+                    );
+
+                    broadcastLiveEvent(
+                        record,
+                        migrationEvent,
+                        makeSnapshotPatch(
+                            null,
+                            record.snapshot,
+                        ),
+                    );
+                }
+
+                const member =
                     record.members.get(
                         clientId,
                     );
-
-                if (
-                    !existing &&
-                    record.members.size >=
-                        MAX_MEMBERS_PER_SCOPE
-                ) {
-                    return httpError(
-                        res,
-                        429,
-                        'scope_client_limit',
-                        'Too many clients in this sync scope',
-                    );
-                }
 
                 record.members.set(
                     clientId,
                     {
                         clientId,
+
                         deviceId,
 
                         joinedAt:
-                            existing?.joinedAt ??
+                            member?.joinedAt ||
                             now(),
 
                         lastSeen:
@@ -1687,41 +3715,78 @@ async function init(
                     },
                 );
 
-                schedulePersist(
+                record.lastAccessAt =
+                    now();
+
+                checkGenerationLease(
                     record,
                 );
 
-                return ok(
-                    res,
-                    {
-                        scope:
-                            clone(
-                                scope,
-                            ),
+                const subscriptionToken =
+                    issueSubscriptionToken(
+                        userId,
+                        scope,
+                        clientId,
+                        deviceId,
+                    );
 
-                        state:
-                            publicState(
-                                record,
-                            ),
-
-                        member: {
-                            clientId,
-                            deviceId,
-                        },
-                    },
+                await persistScope(
+                    record,
+                    false,
                 );
+
+                return res.json({
+                    ok:
+                        true,
+
+                    principalKey:
+                        makePrincipalKey(
+                            userId,
+                        ),
+
+                    subscriptionToken,
+
+                    scope:
+                        clone(
+                            scope,
+                        ),
+
+                    divergence:
+                        actual.snapshot &&
+                        record.snapshot &&
+                        record.snapshotHash !==
+                            actual.hash
+                            ? {
+                                detected:
+                                    true,
+
+                                serverHash:
+                                    record.snapshotHash,
+
+                                stHash:
+                                    actual.hash,
+
+                                stMtimeMs:
+                                    actual.mtimeMs,
+
+                                stSize:
+                                    actual.size,
+                            }
+                            : null,
+
+                    state:
+                        publicState(
+                            record,
+                            {
+                                includeSnapshot:
+                                    true,
+                            },
+                        ),
+                });
             } catch (error) {
-                return httpError(
+                return sendError(
                     res,
-                    error.code ===
-                        'protocol_mismatch'
-                        ? 426
-                        : 400,
-
-                    error.code ||
-                        'invalid_request',
-
-                    error.message,
+                    error,
                 );
             }
         },
@@ -1729,7 +3794,7 @@ async function init(
 
 
     /* ---------------------------------------------------------------------- */
-    /* Leave                                                                   */
+    /* LEAVE                                                                   */
     /* ---------------------------------------------------------------------- */
 
     router.post(
@@ -1740,40 +3805,57 @@ async function init(
         ) => {
             try {
                 const userId =
-                    userIdFromRequest(
-                        req,
-                    );
+                    req.mcsUserId;
 
                 const scope =
                     normalizeScope(
                         req.body?.scope,
                     );
 
-                const {
-                    clientId,
-                } =
-                    clientEnvelope(
-                        req,
+                const clientId =
+                    normalizeString(
+                        req.body?.clientId,
+                        'clientId',
+                        256,
                     );
 
-                const key =
-                    scopeKey(
+                const deviceId =
+                    normalizeString(
+                        req.body?.deviceId,
+                        'deviceId',
+                        256,
+                    );
+
+                const record =
+                    getScope(
                         userId,
                         scope,
                     );
 
-                const record =
-                    scopes.get(
-                        key,
+                if (!record) {
+                    return res.json({
+                        ok:
+                            true,
+
+                        left:
+                            false,
+                    });
+                }
+
+                const member =
+                    record.members.get(
+                        clientId,
                     );
 
-                if (!record) {
-                    return ok(
-                        res,
-                        {
-                            left:
-                                false,
-                        },
+                if (
+                    member &&
+                    member.deviceId !==
+                        deviceId
+                ) {
+                    throw new SyncError(
+                        'device_mismatch',
+                        'Client/device identity mismatch',
+                        409,
                     );
                 }
 
@@ -1782,80 +3864,35 @@ async function init(
                 );
 
                 if (
-                    record.generation?.ownerClientId ===
+                    record.generation
+                        ?.ownerClientId ===
                     clientId
                 ) {
-                    record.generation = {
-                        ...record.generation,
-
-                        state:
-                            'abandoned',
-
-                        leaseUntil:
-                            0,
-                    };
-
-                    const oldGeneration =
-                        record.generation;
-
-                    record.revision += 1;
-
-                    const event =
-                        makeEvent(
-                            record,
-                            {
-                                type:
-                                    'generation_abandoned',
-
-                                sourceClientId:
-                                    clientId,
-
-                                payload: {
-                                    reason:
-                                        'owner_left',
-
-                                    generationId:
-                                        oldGeneration.id,
-                                },
-
-                                generation:
-                                    oldGeneration,
-                            },
-                        );
-
-                    event.revision =
-                        record.revision;
-
-                    record.generation =
-                        null;
-
-                    broadcast(
+                    abandonGeneration(
                         record,
-                        event,
+                        'owner_left',
                     );
                 }
 
-                await schedulePersist(
+                record.lastAccessAt =
+                    now();
+
+                await persistScope(
                     record,
                     true,
                 );
 
-                return ok(
-                    res,
-                    {
-                        left:
-                            true,
-                    },
-                );
+                return res.json({
+                    ok:
+                        true,
+
+                    left:
+                        true,
+                });
             } catch (error) {
-                return httpError(
+                return sendError(
                     res,
-                    400,
-
-                    error.code ||
-                        'invalid_request',
-
-                    error.message,
+                    error,
                 );
             }
         },
@@ -1863,7 +3900,7 @@ async function init(
 
 
     /* ---------------------------------------------------------------------- */
-    /* Heartbeat                                                               */
+    /* HEARTBEAT                                                               */
     /* ---------------------------------------------------------------------- */
 
     router.post(
@@ -1873,41 +3910,41 @@ async function init(
             res,
         ) => {
             try {
-                const userId =
-                    userIdFromRequest(
-                        req,
-                    );
+                consumeRate(
+                    req.mcsUserId,
+                    'heartbeat',
+                );
 
                 const scope =
                     normalizeScope(
                         req.body?.scope,
                     );
 
-                const {
-                    clientId,
-                    deviceId,
-                } =
-                    clientEnvelope(
-                        req,
+                const clientId =
+                    normalizeString(
+                        req.body?.clientId,
+                        'clientId',
+                        256,
                     );
 
-                const key =
-                    scopeKey(
-                        userId,
-                        scope,
+                const deviceId =
+                    normalizeString(
+                        req.body?.deviceId,
+                        'deviceId',
+                        256,
                     );
 
                 const record =
-                    scopes.get(
-                        key,
+                    getScope(
+                        req.mcsUserId,
+                        scope,
                     );
 
                 if (!record) {
-                    return httpError(
-                        res,
-                        404,
+                    throw new SyncError(
                         'scope_not_found',
-                        'Sync scope does not exist yet',
+                        'Synchronization scope not found',
+                        404,
                     );
                 }
 
@@ -1915,75 +3952,223 @@ async function init(
                     requireMember(
                         record,
                         clientId,
+                        deviceId,
                     );
 
-                if (
-                    member.deviceId !==
-                    deviceId
-                ) {
-                    return httpError(
-                        res,
-                        409,
-                        'device_mismatch',
-                        'Client identity changed for this membership',
-                    );
-                }
+                record.lastAccessAt =
+                    now();
 
-                expireGeneration(
+                checkGenerationLease(
                     record,
                 );
 
+                const generationId =
+                    req.body?.generationId
+                        ? String(
+                            req.body
+                                .generationId,
+                        )
+                        : null;
+
                 if (
+                    generationId &&
                     record.generation &&
-                    record.generation.ownerClientId ===
+                    record.generation.id ===
+                        generationId &&
+                    record.generation
+                        .ownerClientId ===
                         clientId
                 ) {
-                    const generationId =
-                        String(
-                            req.body?.generationId ||
-                                '',
-                        );
-
-                    if (
-                        generationId ===
-                        record.generation.id
-                    ) {
-                        record.generation.leaseUntil =
-                            now() +
-                            GENERATION_LEASE_MS;
-                    }
+                    record.generation
+                        .leaseUntil =
+                        now() +
+                        GENERATION_LEASE_MS;
                 }
 
-                return ok(
-                    res,
-                    {
-                        serverTime:
-                            now(),
+                member.lastSeen =
+                    now();
 
-                        state:
-                            publicState(
-                                record,
-                            ),
-                    },
-                );
+                member.expiresAt =
+                    now() +
+                    MEMBER_TTL_MS;
+
+                return res.json({
+                    ok:
+                        true,
+
+                    serverTime:
+                        now(),
+
+                    subscriptionToken:
+                        issueSubscriptionToken(
+                            req.mcsUserId,
+                            scope,
+                            clientId,
+                            deviceId,
+                        ),
+
+                    state:
+                        publicState(
+                            record,
+                            {
+                                includeSnapshot:
+                                    false,
+                            },
+                        ),
+                });
             } catch (error) {
-                return httpError(
+                return sendError(
                     res,
-                    error.code ===
-                        'not_member' ||
-                    error.code ===
-                        'membership_expired'
-                        ? 403
-                        : 400,
-
-                    error.code ||
-                        'invalid_request',
-
-                    error.message,
+                    error,
                 );
             }
         },
     );
+
+
+    /* ---------------------------------------------------------------------- */
+    /* STATE GET                                                               */
+    /* ---------------------------------------------------------------------- */
+
+    router.get(
+        '/state',
+        async (
+            req,
+            res,
+        ) => {
+            try {
+                const clientId =
+                    normalizeString(
+                        req.query.clientId,
+                        'clientId',
+                        256,
+                    );
+
+                const deviceId =
+                    normalizeString(
+                        req.query.deviceId,
+                        'deviceId',
+                        256,
+                    );
+
+                const scope =
+                    normalizeScope(
+                        JSON.parse(
+                            String(
+                                req.query.scope,
+                            ),
+                        ),
+                    );
+
+                return stateHandler(
+                    req,
+                    res,
+                    clientId,
+                    deviceId,
+                    scope,
+                );
+            } catch (error) {
+                return sendError(
+                    res,
+                    error,
+                );
+            }
+        },
+    );
+
+
+    /* ---------------------------------------------------------------------- */
+    /* STATE POST                                                              */
+    /* ---------------------------------------------------------------------- */
+
+    router.post(
+        '/state',
+        async (
+            req,
+            res,
+        ) => {
+            try {
+                const clientId =
+                    normalizeString(
+                        req.body.clientId,
+                        'clientId',
+                        256,
+                    );
+
+                const deviceId =
+                    normalizeString(
+                        req.body.deviceId,
+                        'deviceId',
+                        256,
+                    );
+
+                const scope =
+                    normalizeScope(
+                        req.body.scope,
+                    );
+
+                return stateHandler(
+                    req,
+                    res,
+                    clientId,
+                    deviceId,
+                    scope,
+                );
+            } catch (error) {
+                return sendError(
+                    res,
+                    error,
+                );
+            }
+        },
+    );
+
+
+    async function stateHandler(
+        req,
+        res,
+        clientId,
+        deviceId,
+        scope,
+    ) {
+        const record =
+            getScope(
+                req.mcsUserId,
+                scope,
+            );
+
+        if (!record) {
+            throw new SyncError(
+                'scope_not_found',
+                'Synchronization scope not found',
+                404,
+            );
+        }
+
+        requireMember(
+            record,
+            clientId,
+            deviceId,
+        );
+
+        checkGenerationLease(
+            record,
+        );
+
+        return res.json({
+            ok:
+                true,
+
+            state:
+                publicState(
+                    record,
+                    {
+                        includeSnapshot:
+                            true,
+                    },
+                ),
+        });
+    }
 
 
     /* ---------------------------------------------------------------------- */
@@ -1996,86 +4181,107 @@ async function init(
             req,
             res,
         ) => {
-            let record;
-            let keepaliveTimer;
+            let cleanup =
+                null;
+
+            let keepalive =
+                null;
 
             try {
-                const userId =
-                    userIdFromRequest(
-                        req,
+                const token =
+                    verifySubscriptionToken(
+                        String(
+                            req.query.token ||
+                                '',
+                        ),
                     );
 
-                const scope =
-                    scopeFromRequest(
-                        req,
+                if (
+                    token.user !==
+                    req.mcsUserId
+                ) {
+                    throw new SyncError(
+                        'invalid_subscription',
+                        'Subscription user mismatch',
+                        403,
                     );
+                }
 
                 const clientId =
-                    validateId(
-                        req.query.clientId,
+                    normalizeString(
+                        token.clientId,
                         'clientId',
                         256,
                     );
 
                 const deviceId =
-                    validateId(
-                        req.query.deviceId,
+                    normalizeString(
+                        token.deviceId,
                         'deviceId',
                         256,
                     );
 
-                const key =
-                    scopeKey(
-                        userId,
+                const parsedScope =
+                    parseScopeKey(
+                        token.scope,
+                    );
+
+                const scope =
+                    normalizeScope(
+                        {
+                            scopeType:
+                                parsedScope
+                                    .scopeType,
+
+                            characterId:
+                                parsedScope
+                                    .characterId,
+
+                            groupId:
+                                parsedScope
+                                    .groupId,
+
+                            chatId:
+                                parsedScope
+                                    .chatId,
+
+                            branchId:
+                                parsedScope
+                                    .branchId,
+
+                            parentChatId:
+                                parsedScope
+                                    .parentChatId,
+                        },
+                    );
+
+                const record =
+                    getScope(
+                        req.mcsUserId,
                         scope,
                     );
 
-                record =
-                    scopes.get(
-                        key,
-                    );
-
                 if (!record) {
-                    return httpError(
-                        res,
-                        404,
+                    throw new SyncError(
                         'scope_not_found',
-                        'Join the scope before opening SSE',
+                        'Synchronization scope not found',
+                        404,
                     );
                 }
 
-                const member =
-                    requireMember(
-                        record,
-                        clientId,
-                    );
+                requireMember(
+                    record,
+                    clientId,
+                    deviceId,
+                );
 
-                if (
-                    member.deviceId !==
-                    deviceId
-                ) {
-                    return httpError(
-                        res,
-                        409,
-                        'device_mismatch',
-                        'Client identity changed for this membership',
-                    );
-                }
-
-                expireGeneration(
+                checkGenerationLease(
                     record,
                 );
 
-                const cursor =
-                    parseEventCursor(
-                        req.get(
-                            'Last-Event-ID',
-                        ) ||
-                        req.query.since ||
-                        '',
-                    );
-
-                res.status(200);
+                res.status(
+                    200,
+                );
 
                 res.setHeader(
                     'Content-Type',
@@ -2104,24 +4310,12 @@ async function init(
                     res.flushHeaders();
                 }
 
-                let clients =
-                    sseByScope.get(
-                        key,
+                cleanup =
+                    addSseClient(
+                        record,
+                        clientId,
+                        res,
                     );
-
-                if (!clients) {
-                    clients =
-                        new Set();
-
-                    sseByScope.set(
-                        key,
-                        clients,
-                    );
-                }
-
-                clients.add(
-                    res,
-                );
 
                 sendSse(
                     res,
@@ -2130,28 +4324,47 @@ async function init(
                         protocolVersion:
                             PROTOCOL_VERSION,
 
+                        schemaVersion:
+                            STATE_SCHEMA_VERSION,
+
                         epoch:
                             runtimeEpoch,
+
+                        seq:
+                            record.seq,
 
                         revision:
                             record.revision,
 
-                        seq:
-                            record.seq,
+                        lastEventId:
+                            record.seq > 0
+                                ? eventId(
+                                    record.seq,
+                                )
+                                : null,
 
                         snapshotHash:
                             record.snapshotHash,
 
                         generation:
-                            record.generation
-                                ? compactGeneration(
-                                    record.generation,
-                                )
-                                : null,
+                            publicGeneration(
+                                record.generation,
+                            ),
                     },
                 );
 
-                if (cursor) {
+                const cursor =
+                    parseEventId(
+                        req.get(
+                            'Last-Event-ID',
+                        ) ||
+                            req.query.since ||
+                            '',
+                    );
+
+                if (
+                    cursor
+                ) {
                     if (
                         cursor.epoch !==
                         runtimeEpoch
@@ -2166,22 +4379,25 @@ async function init(
                                 epoch:
                                     runtimeEpoch,
 
-                                revision:
-                                    record.revision,
-
                                 seq:
                                     record.seq,
+
+                                revision:
+                                    record.revision,
                             },
                         );
                     } else {
-                        const oldest =
+                        const firstSeq =
                             record.events.length
-                                ? record.events[0].seq
-                                : record.seq + 1;
+                                ? record.events[0]
+                                      .seq
+                                : record.seq +
+                                      1;
 
                         if (
                             cursor.seq <
-                            oldest - 1
+                            firstSeq -
+                                1
                         ) {
                             sendSse(
                                 res,
@@ -2193,25 +4409,21 @@ async function init(
                                     epoch:
                                         runtimeEpoch,
 
-                                    revision:
-                                        record.revision,
-
                                     seq:
                                         record.seq,
+
+                                    revision:
+                                        record.revision,
                                 },
                             );
                         } else {
+                            let replayed =
+                                0;
+
                             for (
                                 const event of
                                     record.events
                             ) {
-                                if (
-                                    event.epoch !==
-                                    runtimeEpoch
-                                ) {
-                                    continue;
-                                }
-
                                 if (
                                     event.seq <=
                                     cursor.seq
@@ -2220,81 +4432,43 @@ async function init(
                                 }
 
                                 /*
-                                 * Stream events cannot reconstruct an exact
-                                 * stream state from replay alone. Pull /state.
+                                 * Historical replay contains metadata only.
+                                 * The client requests /state at replay completion.
                                  */
-                                if (
-                                    event.type ===
-                                    'generation_stream'
-                                ) {
-                                    sendSse(
-                                        res,
-                                        'resync_required',
-                                        {
-                                            reason:
-                                                'stream_replay_requires_state',
-
-                                            epoch:
-                                                runtimeEpoch,
-
-                                            revision:
-                                                record.revision,
-
-                                            seq:
-                                                record.seq,
-                                        },
-                                    );
-
-                                    break;
-                                }
-
                                 sendSse(
                                     res,
-                                    'sync',
-                                    {
-                                        ...clone(
-                                            event,
-                                        ),
-
-                                        state: {
-                                            epoch:
-                                                runtimeEpoch,
-
-                                            revision:
-                                                record.revision,
-
-                                            seq:
-                                                record.seq,
-
-                                            snapshotHash:
-                                                record.snapshotHash,
-
-                                            generation:
-                                                record.generation
-                                                    ? compactGeneration(
-                                                        record.generation,
-                                                    )
-                                                    : null,
-                                        },
-
-                                        snapshot:
-                                            event.snapshot ??
-                                            (
-                                                record.snapshot
-                                                    ? clone(
-                                                        record.snapshot,
-                                                    )
-                                                    : null
-                                            ),
-                                    },
+                                    'replay',
+                                    clone(
+                                        event,
+                                    ),
                                     event.id,
                                 );
+
+                                replayed +=
+                                    1;
                             }
+
+                            sendSse(
+                                res,
+                                'replay_complete',
+                                {
+                                    replayed,
+
+                                    currentSeq:
+                                        record.seq,
+
+                                    currentRevision:
+                                        record.revision,
+
+                                    epoch:
+                                        runtimeEpoch,
+                                },
+                            );
                         }
                     }
                 }
 
-                keepaliveTimer =
+                keepalive =
                     setInterval(
                         () => {
                             try {
@@ -2308,18 +4482,31 @@ async function init(
                                     `: keepalive ${now()}\n\n`,
                                 );
 
-                                member.lastSeen =
-                                    now();
-
-                                member.expiresAt =
-                                    now() +
-                                    MEMBER_TTL_MS;
+                                const member =
+                                    record.members.get(
+                                        clientId,
+                                    );
 
                                 if (
-                                    record.generation?.ownerClientId ===
+                                    member
+                                ) {
+                                    member.lastSeen =
+                                        now();
+
+                                    member.expiresAt =
+                                        now() +
+                                        MEMBER_TTL_MS;
+                                }
+
+                                if (
+                                    record
+                                        .generation
+                                        ?.ownerClientId ===
                                     clientId
                                 ) {
-                                    record.generation.leaseUntil =
+                                    record
+                                        .generation
+                                        .leaseUntil =
                                         now() +
                                         GENERATION_LEASE_MS;
                                 }
@@ -2331,152 +4518,58 @@ async function init(
                                 }
                             }
                         },
-                        KEEPALIVE_MS,
+                        SSE_KEEPALIVE_MS,
                     );
 
-                const cleanup =
+                const close =
                     () => {
                         if (
-                            keepaliveTimer
+                            keepalive
                         ) {
                             clearInterval(
-                                keepaliveTimer,
+                                keepalive,
                             );
+
+                            keepalive =
+                                null;
                         }
 
-                        const set =
-                            sseByScope.get(
-                                key,
-                            );
-
-                        if (set) {
-                            set.delete(
-                                res,
-                            );
-
-                            if (
-                                set.size ===
-                                0
-                            ) {
-                                sseByScope.delete(
-                                    key,
-                                );
-                            }
+                        if (
+                            cleanup
+                        ) {
+                            cleanup();
+                            cleanup =
+                                null;
                         }
                     };
 
                 req.on(
                     'close',
-                    cleanup,
+                    close,
                 );
 
                 res.on(
                     'close',
-                    cleanup,
+                    close,
                 );
             } catch (error) {
-                return httpError(
-                    res,
-                    error.code ===
-                        'not_member' ||
-                    error.code ===
-                        'membership_expired'
-                        ? 403
-                        : 400,
-
-                    error.code ||
-                        'invalid_request',
-
-                    error.message,
-                );
-            }
-        },
-    );
-
-
-    /* ---------------------------------------------------------------------- */
-    /* State                                                                    */
-    /* ---------------------------------------------------------------------- */
-
-    router.get(
-        '/state',
-        async (
-            req,
-            res,
-        ) => {
-            try {
-                const userId =
-                    userIdFromRequest(
-                        req,
-                    );
-
-                const scope =
-                    scopeFromRequest(
-                        req,
-                    );
-
-                const clientId =
-                    validateId(
-                        req.query.clientId,
-                        'clientId',
-                        256,
-                    );
-
-                const key =
-                    scopeKey(
-                        userId,
-                        scope,
-                    );
-
-                const record =
-                    scopes.get(
-                        key,
-                    );
-
-                if (!record) {
-                    return httpError(
-                        res,
-                        404,
-                        'scope_not_found',
-                        'Sync scope does not exist yet',
+                if (
+                    keepalive
+                ) {
+                    clearInterval(
+                        keepalive,
                     );
                 }
 
-                requireMember(
-                    record,
-                    clientId,
-                );
+                if (
+                    cleanup
+                ) {
+                    cleanup();
+                }
 
-                expireGeneration(
-                    record,
-                );
-
-                return ok(
+                return sendError(
                     res,
-                    {
-                        scope:
-                            clone(scope),
-
-                        state:
-                            publicState(
-                                record,
-                            ),
-                    },
-                );
-            } catch (error) {
-                return httpError(
-                    res,
-                    error.code ===
-                        'not_member' ||
-                    error.code ===
-                        'membership_expired'
-                        ? 403
-                        : 400,
-
-                    error.code ||
-                        'invalid_request',
-
-                    error.message,
+                    error,
                 );
             }
         },
@@ -2484,7 +4577,7 @@ async function init(
 
 
     /* ---------------------------------------------------------------------- */
-    /* Event                                                                     */
+    /* EVENT                                                                   */
     /* ---------------------------------------------------------------------- */
 
     router.post(
@@ -2495,142 +4588,115 @@ async function init(
         ) => {
             try {
                 const userId =
-                    userIdFromRequest(
-                        req,
+                    req.mcsUserId;
+
+                const clientId =
+                    normalizeString(
+                        req.body.clientId,
+                        'clientId',
+                        256,
                     );
 
-                const scope =
-                    normalizeScope(
-                        req.body?.scope,
+                const deviceId =
+                    normalizeString(
+                        req.body.deviceId,
+                        'deviceId',
+                        256,
                     );
-
-                const {
-                    clientId,
-                    deviceId,
-                    body,
-                } =
-                    clientEnvelope(
-                        req,
-                    );
-
-                const key =
-                    scopeKey(
-                        userId,
-                        scope,
-                    );
-
-                const record =
-                    scopes.get(
-                        key,
-                    );
-
-                if (!record) {
-                    return httpError(
-                        res,
-                        404,
-                        'scope_not_found',
-                        'Join the sync scope first',
-                    );
-                }
-
-                const member =
-                    requireMember(
-                        record,
-                        clientId,
-                    );
-
-                if (
-                    member.deviceId !==
-                    deviceId
-                ) {
-                    return httpError(
-                        res,
-                        409,
-                        'device_mismatch',
-                        'Client identity changed for this membership',
-                    );
-                }
-
-                expireGeneration(
-                    record,
-                );
 
                 const opId =
-                    validateId(
-                        body.opId,
+                    normalizeString(
+                        req.body.opId,
                         'opId',
                         256,
                     );
 
                 const type =
-                    validateId(
-                        body.type,
+                    normalizeString(
+                        req.body.type,
                         'type',
                         128,
                     );
 
-                const bytes =
-                    jsonBytes(
-                        body,
+                const scope =
+                    normalizeScope(
+                        req.body.scope,
                     );
 
-                if (
-                    bytes >
-                    MAX_EVENT_BYTES
-                ) {
-                    return httpError(
-                        res,
-                        413,
-                        'payload_too_large',
-                        'Event exceeds sync limit',
+                const record =
+                    getScope(
+                        userId,
+                        scope,
+                    );
+
+                if (!record) {
+                    throw new SyncError(
+                        'scope_not_found',
+                        'Synchronization scope not found',
+                        404,
                     );
                 }
 
-                /*
-                 * Idempotency.
-                 */
-                if (
-                    hasSeenOp(
+                requireMember(
+                    record,
+                    clientId,
+                    deviceId,
+                );
+
+                checkGenerationLease(
+                    record,
+                );
+
+                const duplicate =
+                    findOperation(
                         record,
                         opId,
-                    )
-                ) {
-                    return ok(
-                        res,
-                        {
-                            duplicate:
-                                true,
-
-                            state:
-                                publicState(
-                                    record,
-                                ),
-                        },
                     );
+
+                if (
+                    duplicate
+                ) {
+                    return res.json({
+                        ok:
+                            true,
+
+                        ...duplicate,
+                    });
                 }
 
+                const baseRevision =
+                    Number(
+                        req.body
+                            .baseRevision,
+                    );
 
-                /* ---------------------------------------------------------- */
-                /* Generation claim                                            */
-                /* ---------------------------------------------------------- */
+                const payload =
+                    req.body.payload ||
+                    {};
 
+                validateDataTree(
+                    payload,
+                );
+
+                /*
+                 * Generation claim.
+                 */
                 if (
                     type ===
                     'generation_claim'
                 ) {
-                    checkBaseRevision(
+                    requireBaseRevision(
                         record,
-                        body,
+                        baseRevision,
                     );
 
                     if (
                         record.generation
                     ) {
-                        return httpError(
-                            res,
-                            409,
+                        throw new SyncError(
                             'generation_owned',
                             'Another client already owns generation',
+                            409,
                             {
                                 state:
                                     publicState(
@@ -2641,8 +4707,9 @@ async function init(
                     }
 
                     const generationId =
-                        validateId(
-                            body.generationId,
+                        normalizeString(
+                            req.body
+                                .generationId,
                             'generationId',
                             256,
                         );
@@ -2657,15 +4724,35 @@ async function init(
                         ownerDeviceId:
                             deviceId,
 
+                        type:
+                            normalizeString(
+                                String(
+                                    req.body
+                                        .generationType ||
+                                        'unknown',
+                                ),
+                                'generationType',
+                                128,
+                            ),
+
+                        targetMessageId:
+                            req.body
+                                .targetMessageId
+                                ? String(
+                                    req.body
+                                        .targetMessageId,
+                                )
+                                : null,
+
                         state:
-                            'running',
+                            'claimed',
+
+                        startedAt:
+                            now(),
 
                         leaseUntil:
                             now() +
                             GENERATION_LEASE_MS,
-
-                        startedAt:
-                            now(),
 
                         streamSeq:
                             0,
@@ -2680,15 +4767,14 @@ async function init(
                     record.generation =
                         generation;
 
-                    record.revision += 1;
+                    const previousRevision =
+                        record.revision;
 
-                    rememberOp(
-                        record,
-                        opId,
-                    );
+                    record.revision +=
+                        1;
 
                     const event =
-                        makeEvent(
+                        appendEvent(
                             record,
                             {
                                 type:
@@ -2702,93 +4788,78 @@ async function init(
                                 sourceDeviceId:
                                     deviceId,
 
+                                baseRevision:
+                                    previousRevision,
+
                                 payload: {
                                     generationId,
+
+                                    generationType:
+                                        generation.type,
+
+                                    targetMessageId:
+                                        generation.targetMessageId,
                                 },
 
                                 generation,
                             },
                         );
 
-                    event.revision =
-                        record.revision;
+                    const state =
+                        publicState(
+                            record,
+                        );
 
-                    broadcast(
-                        record,
+                    const result = {
+                        accepted:
+                            true,
+
                         event,
+
+                        state,
+                    };
+
+                    rememberOperation(
+                        record,
+                        opId,
+                        result,
                     );
 
-                    await schedulePersist(
+                    await persistScope(
                         record,
                         true,
                     );
 
-                    return ok(
-                        res,
-                        {
-                            accepted:
-                                true,
-
-                            event,
-
-                            state:
-                                publicState(
-                                    record,
-                                ),
-                        },
+                    broadcastLiveEvent(
+                        record,
+                        event,
+                        null,
                     );
+
+                    return res.json({
+                        ok:
+                            true,
+
+                        ...result,
+                    });
                 }
 
 
-                /* ---------------------------------------------------------- */
-                /* Generation stop request                                     */
-                /* ---------------------------------------------------------- */
-
+                /*
+                 * Generation started.
+                 */
                 if (
                     type ===
-                    'generation_stop_request'
+                    'generation_started'
                 ) {
-                    checkBaseRevision(
-                        record,
-                        body,
-                    );
+                    const generation =
+                        record.generation;
 
-                    if (
-                        !record.generation
-                    ) {
-                        return ok(
-                            res,
-                            {
-                                accepted:
-                                    false,
-
-                                reason:
-                                    'no_active_generation',
-
-                                state:
-                                    publicState(
-                                        record,
-                                    ),
-                            },
-                        );
-                    }
-
-                    const generationId =
-                        validateId(
-                            body.generationId,
-                            'generationId',
-                            256,
-                        );
-
-                    if (
-                        generationId !==
-                        record.generation.id
-                    ) {
-                        return httpError(
-                            res,
-                            409,
+                    if (!generation) {
+                        throw new SyncError(
                             'generation_stale',
-                            'Generation ID is no longer active',
+                            'No active generation',
+                            409,
                             {
                                 state:
                                     publicState(
@@ -2798,47 +4869,83 @@ async function init(
                         );
                     }
 
-                    record.stopRequestIds.add(
-                        opId,
-                    );
-
                     if (
-                        record.stopRequestIds.size >
-                        MAX_SEEN_OPS
+                        generation.ownerClientId !==
+                        clientId
                     ) {
-                        record.stopRequestIds =
-                            new Set(
-                                [
-                                    ...record.stopRequestIds,
-                                ].slice(
-                                    -MAX_SEEN_OPS,
-                                ),
-                            );
+                        throw new SyncError(
+                            'generation_not_owner',
+                            'Only the generation owner can start the claimed generation',
+                            409,
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
                     }
 
-                    record.generation.stopRequested =
-                        true;
+                    requireBaseRevision(
+                        record,
+                        baseRevision,
+                    );
 
-                    record.generation.stopRequesterClientId =
-                        clientId;
+                    /*
+                     * Idempotent state transition.
+                     */
+                    if (
+                        generation.state ===
+                        'streaming'
+                    ) {
+                        const state =
+                            publicState(
+                                record,
+                            );
 
-                    record.generation.leaseUntil =
+                        const result = {
+                            accepted:
+                                true,
+
+                            duplicate:
+                                true,
+
+                            state,
+                        };
+
+                        rememberOperation(
+                            record,
+                            opId,
+                            result,
+                        );
+
+                        return res.json({
+                            ok:
+                                true,
+
+                            ...result,
+                        });
+                    }
+
+                    generation.state =
+                        'streaming';
+
+                    generation.leaseUntil =
                         now() +
                         GENERATION_LEASE_MS;
 
-                    record.revision += 1;
+                    const previousRevision =
+                        record.revision;
 
-                    rememberOp(
-                        record,
-                        opId,
-                    );
+                    record.revision +=
+                        1;
 
                     const event =
-                        makeEvent(
+                        appendEvent(
                             record,
                             {
                                 type:
-                                    'generation_stop_requested',
+                                    'generation_started',
 
                                 opId,
 
@@ -2848,63 +4955,73 @@ async function init(
                                 sourceDeviceId:
                                     deviceId,
 
-                                payload: {
-                                    generationId,
+                                baseRevision:
+                                    previousRevision,
 
-                                    requesterClientId:
-                                        clientId,
+                                payload: {
+                                    generationId:
+                                        generation.id,
                                 },
 
-                                generation:
-                                    record.generation,
+                                generation,
                             },
                         );
 
-                    event.revision =
-                        record.revision;
+                    const state =
+                        publicState(
+                            record,
+                        );
 
-                    broadcast(
+                    const result = {
+                        accepted:
+                            true,
+
+                        event,
+
+                        state,
+                    };
+
+                    rememberOperation(
+                        record,
+                        opId,
+                        result,
+                    );
+
+                    await persistScope(
+                        record,
+                        true,
+                    );
+
+                    broadcastLiveEvent(
                         record,
                         event,
+                        null,
                     );
 
-                    schedulePersist(
-                        record,
-                    );
+                    return res.json({
+                        ok:
+                            true,
 
-                    return ok(
-                        res,
-                        {
-                            accepted:
-                                true,
-
-                            event,
-
-                            state:
-                                publicState(
-                                    record,
-                                ),
-                        },
-                    );
+                        ...result,
+                    });
                 }
 
 
-                /* ---------------------------------------------------------- */
-                /* Generation streaming                                        */
-                /* ---------------------------------------------------------- */
-
+                /*
+                 * Generation stream.
+                 */
                 if (
                     type ===
                     'generation_stream'
                 ) {
-                    if (
-                        !record.generation
-                    ) {
-                        return httpError(
-                            res,
-                            409,
+                    const generation =
+                        record.generation;
+
+                    if (!generation) {
+                        throw new SyncError(
                             'generation_stale',
                             'No active generation',
+                            409,
                             {
                                 state:
                                     publicState(
@@ -2915,14 +5032,13 @@ async function init(
                     }
 
                     if (
-                        record.generation.ownerClientId !==
+                        generation.ownerClientId !==
                         clientId
                     ) {
-                        return httpError(
-                            res,
-                            409,
+                        throw new SyncError(
                             'generation_not_owner',
-                            'Only the generation owner may publish stream state',
+                            'Only generation owner may publish stream state',
+                            409,
                             {
                                 state:
                                     publicState(
@@ -2932,74 +5048,92 @@ async function init(
                         );
                     }
 
-                    const generationId =
-                        validateId(
-                            body.generationId,
-                            'generationId',
-                            256,
-                        );
-
                     if (
-                        generationId !==
-                        record.generation.id
+                        req.body
+                            .generationId !==
+                        generation.id
                     ) {
-                        return httpError(
-                            res,
-                            409,
+                        throw new SyncError(
                             'generation_stale',
                             'Generation ID is no longer active',
-                            {
-                                state:
-                                    publicState(
-                                        record,
-                                    ),
-                            },
+                            409,
                         );
                     }
 
                     if (
-                        record.generation.leaseUntil <=
+                        generation.leaseUntil <=
                         now()
                     ) {
-                        expireGeneration(
+                        abandonGeneration(
                             record,
+                            'lease_expired',
                         );
 
-                        return httpError(
-                            res,
-                            409,
+                        throw new SyncError(
                             'generation_expired',
                             'Generation lease expired',
-                            {
-                                state:
-                                    publicState(
-                                        record,
-                                    ),
-                            },
+                            409,
                         );
                     }
 
                     const streamSeq =
                         Number(
-                            body.streamSeq,
+                            req.body
+                                .streamSeq,
                         );
 
                     if (
                         !Number.isSafeInteger(
                             streamSeq,
-                        ) ||
-                        streamSeq <=
-                            record.generation.streamSeq
+                        )
                     ) {
-                        return ok(
-                            res,
+                        throw new SyncError(
+                            'invalid_stream_sequence',
+                            'Invalid stream sequence',
+                        );
+                    }
+
+                    if (
+                        streamSeq <=
+                        generation.streamSeq
+                    ) {
+                        const result = {
+                            accepted:
+                                true,
+
+                            duplicate:
+                                true,
+
+                            state:
+                                publicState(
+                                    record,
+                                ),
+                        };
+
+                        rememberOperation(
+                            record,
+                            opId,
+                            result,
+                        );
+
+                        return res.json({
+                            ok:
+                                true,
+
+                            ...result,
+                        });
+                    }
+
+                    if (
+                        streamSeq !==
+                        generation.streamSeq +
+                            1
+                    ) {
+                        throw new SyncError(
+                            'stream_sequence_gap',
+                            'Generation stream sequence is not contiguous',
+                            409,
                             {
-                                duplicate:
-                                    true,
-
-                                reason:
-                                    'stream_sequence',
-
                                 state:
                                     publicState(
                                         record,
@@ -3008,54 +5142,65 @@ async function init(
                         );
                     }
 
-                    /*
-                     * Streaming is still revision guarded. This prevents a
-                     * stream chunk from overwriting a newer accepted state.
-                     */
-                    checkBaseRevision(
+                    requireBaseRevision(
                         record,
-                        body,
+                        baseRevision,
                     );
 
-                    validateSnapshot(
-                        body.snapshot,
+                    validateSnapshotShape(
+                        req.body.snapshot,
                     );
+
+                    validateNoDuplicateMessageIds(
+                        req.body.snapshot,
+                    );
+
+                    validateSnapshotLineage(
+                        req.body.snapshot,
+                        scope,
+                    );
+
+                    const previousSnapshot =
+                        record.snapshot
+                            ? clone(
+                                record.snapshot,
+                            )
+                            : null;
 
                     record.snapshot =
                         clone(
-                            body.snapshot,
+                            req.body.snapshot,
                         );
 
                     record.snapshotHash =
-                        crypto
-                            .createHash(
-                                'sha256',
-                            )
-                            .update(
-                                stableStringify(
-                                    record.snapshot,
-                                ),
-                            )
-                            .digest(
-                                'hex',
-                            );
+                        sha256(
+                            record.snapshot,
+                        );
 
-                    record.generation.streamSeq =
+                    generation.streamSeq =
                         streamSeq;
 
-                    record.generation.leaseUntil =
+                    generation.leaseUntil =
                         now() +
                         GENERATION_LEASE_MS;
 
-                    record.revision += 1;
+                    generation.state =
+                        'streaming';
 
-                    rememberOp(
-                        record,
-                        opId,
-                    );
+                    const previousRevision =
+                        record.revision;
+
+                    record.revision +=
+                        1;
+
+                    const patch =
+                        makeSnapshotPatch(
+                            previousSnapshot,
+                            record.snapshot,
+                        );
 
                     const event =
-                        makeEvent(
+                        appendEvent(
                             record,
                             {
                                 type:
@@ -3069,65 +5214,275 @@ async function init(
                                 sourceDeviceId:
                                     deviceId,
 
+                                baseRevision:
+                                    previousRevision,
+
                                 payload: {
-                                    generationId,
+                                    generationId:
+                                        generation.id,
 
                                     streamSeq,
+
+                                    reason:
+                                        req.body
+                                            .payload
+                                            ?.reason ||
+                                        'stream',
                                 },
 
-                                generation:
-                                    record.generation,
-
-                                includeSnapshot:
-                                    true,
+                                generation,
                             },
                         );
 
-                    event.revision =
-                        record.revision;
+                    const state =
+                        publicState(
+                            record,
+                            {
+                                includeSnapshot:
+                                    false,
+                            },
+                        );
 
-                    broadcast(
+                    const result = {
+                        accepted:
+                            true,
+
+                        event,
+
+                        state,
+                    };
+
+                    rememberOperation(
+                        record,
+                        opId,
+                        result,
+                    );
+
+                    /*
+                     * Stream state is persisted through the serialized scope
+                     * writer, but not forced to disk for every batch.
+                     */
+                    void persistScope(
+                        record,
+                        false,
+                    );
+
+                    broadcastLiveEvent(
                         record,
                         event,
+                        patch,
                     );
 
-                    schedulePersist(
-                        record,
-                    );
+                    return res.json({
+                        ok:
+                            true,
 
-                    return ok(
-                        res,
-                        {
+                        ...result,
+                    });
+                }
+
+
+                /*
+                 * Remote stop request.
+                 *
+                 * This is a control command rather than a content mutation, so
+                 * it intentionally does not fail merely because the chat's
+                 * revision advanced during streaming. The exact generation ID
+                 * remains the authority.
+                 */
+                if (
+                    type ===
+                    'generation_stop_request'
+                ) {
+                    const generation =
+                        record.generation;
+
+                    if (!generation) {
+                        const result = {
                             accepted:
-                                true,
+                                false,
 
-                            event,
+                            reason:
+                                'no_active_generation',
 
                             state:
                                 publicState(
                                     record,
                                 ),
-                        },
+                        };
+
+                        rememberOperation(
+                            record,
+                            opId,
+                            result,
+                        );
+
+                        return res.json({
+                            ok:
+                                true,
+
+                            ...result,
+                        });
+                    }
+
+                    if (
+                        String(
+                            req.body
+                                .generationId ||
+                                '',
+                        ) !==
+                        generation.id
+                    ) {
+                        throw new SyncError(
+                            'generation_stale',
+                            'Generation ID is no longer active',
+                            409,
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    if (
+                        record.stopRequestIds.has(
+                            opId,
+                        )
+                    ) {
+                        const result = {
+                            accepted:
+                                true,
+
+                            duplicate:
+                                true,
+
+                            state:
+                                publicState(
+                                    record,
+                                ),
+                        };
+
+                        rememberOperation(
+                            record,
+                            opId,
+                            result,
+                        );
+
+                        return res.json({
+                            ok:
+                                true,
+
+                            ...result,
+                        });
+                    }
+
+                    record.stopRequestIds.add(
+                        opId,
                     );
+
+                    generation.stopRequested =
+                        true;
+
+                    generation.stopRequesterClientId =
+                        clientId;
+
+                    generation.leaseUntil =
+                        now() +
+                        GENERATION_LEASE_MS;
+
+                    const previousRevision =
+                        record.revision;
+
+                    record.revision +=
+                        1;
+
+                    const event =
+                        appendEvent(
+                            record,
+                            {
+                                type:
+                                    'generation_stop_requested',
+
+                                opId,
+
+                                sourceClientId:
+                                    clientId,
+
+                                sourceDeviceId:
+                                    deviceId,
+
+                                baseRevision:
+                                    previousRevision,
+
+                                payload: {
+                                    generationId:
+                                        generation.id,
+
+                                    requesterClientId:
+                                        clientId,
+                                },
+
+                                generation,
+                            },
+                        );
+
+                    const state =
+                        publicState(
+                            record,
+                        );
+
+                    const result = {
+                        accepted:
+                            true,
+
+                        event,
+
+                        state,
+                    };
+
+                    rememberOperation(
+                        record,
+                        opId,
+                        result,
+                    );
+
+                    await persistScope(
+                        record,
+                        false,
+                    );
+
+                    broadcastLiveEvent(
+                        record,
+                        event,
+                        null,
+                    );
+
+                    return res.json({
+                        ok:
+                            true,
+
+                        ...result,
+                    });
                 }
 
 
-                /* ---------------------------------------------------------- */
-                /* Generation terminal                                         */
-                /* ---------------------------------------------------------- */
-
+                /*
+                 * Generation terminal.
+                 */
                 if (
                     type ===
                     'generation_terminal'
                 ) {
-                    if (
-                        !record.generation
-                    ) {
-                        return httpError(
-                            res,
-                            409,
+                    const generation =
+                        record.generation;
+
+                    if (!generation) {
+                        throw new SyncError(
                             'generation_stale',
                             'No active generation',
+                            409,
                             {
                                 state:
                                     publicState(
@@ -3138,14 +5493,13 @@ async function init(
                     }
 
                     if (
-                        record.generation.ownerClientId !==
+                        generation.ownerClientId !==
                         clientId
                     ) {
-                        return httpError(
-                            res,
-                            409,
+                        throw new SyncError(
                             'generation_not_owner',
-                            'Only the generation owner may finish the generation',
+                            'Only the generation owner may finish generation',
+                            409,
                             {
                                 state:
                                     publicState(
@@ -3155,28 +5509,15 @@ async function init(
                         );
                     }
 
-                    const generationId =
-                        validateId(
-                            body.generationId,
-                            'generationId',
-                            256,
-                        );
-
                     if (
-                        generationId !==
-                        record.generation.id
+                        req.body
+                            .generationId !==
+                        generation.id
                     ) {
-                        return httpError(
-                            res,
-                            409,
+                        throw new SyncError(
                             'generation_stale',
                             'Generation ID is no longer active',
-                            {
-                                state:
-                                    publicState(
-                                        record,
-                                    ),
-                            },
+                            409,
                         );
                     }
 
@@ -3187,68 +5528,106 @@ async function init(
                             'failed',
                             'abandoned',
                         ].includes(
-                            body.status,
+                            req.body.status,
                         )
-                            ? body.status
+                            ? req.body.status
                             : null;
 
                     if (!status) {
-                        return httpError(
-                            res,
-                            400,
+                        throw new SyncError(
                             'invalid_generation_status',
-                            'Invalid generation terminal state',
+                            'Invalid generation terminal status',
                         );
                     }
 
-                    checkBaseRevision(
+                    requireBaseRevision(
                         record,
-                        body,
+                        baseRevision,
                     );
 
-                    validateSnapshot(
-                        body.snapshot,
+                    validateSnapshotShape(
+                        req.body.snapshot,
                     );
+
+                    validateNoDuplicateMessageIds(
+                        req.body.snapshot,
+                    );
+
+                    validateSnapshotLineage(
+                        req.body.snapshot,
+                        scope,
+                    );
+
+                    /*
+                     * Terminal state gets a fresh, uncached ST-file check. The
+                     * extension is expected to have saved final chat state
+                     * through ST before asking us to close the generation.
+                     */
+                    const actual =
+                        await readStChatSnapshot(
+                            req,
+                            scope,
+                            {
+                                force:
+                                    true,
+                            },
+                        );
+
+                    const incomingHash =
+                        sha256(
+                            req.body.snapshot,
+                        );
+
+                    if (
+                        actual.hash !==
+                        incomingHash
+                    ) {
+                        throw new SyncError(
+                            'st_not_persisted',
+                            'SillyTavern disk state does not match the terminal synchronization snapshot',
+                            409,
+                            {
+                                expectedHash:
+                                    incomingHash,
+
+                                actualHash:
+                                    actual.hash,
+
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    const previousRevision =
+                        record.revision;
 
                     record.snapshot =
                         clone(
-                            body.snapshot,
+                            actual.snapshot,
                         );
 
                     record.snapshotHash =
-                        crypto
-                            .createHash(
-                                'sha256',
-                            )
-                            .update(
-                                stableStringify(
-                                    record.snapshot,
-                                ),
-                            )
-                            .digest(
-                                'hex',
-                            );
+                        actual.hash;
 
-                    record.generation.state =
+                    generation.state =
                         status;
 
-                    record.generation.leaseUntil =
+                    generation.leaseUntil =
                         0;
 
-                    record.revision += 1;
-
-                    rememberOp(
-                        record,
-                        opId,
-                    );
-
-                    const oldGeneration =
+                    const finishedGeneration =
                         clone(
-                            record.generation,
+                            generation,
                         );
 
+                    record.revision +=
+                        1;
+
                     const event =
-                        makeEvent(
+                        appendEvent(
                             record,
                             {
                                 type:
@@ -3262,76 +5641,453 @@ async function init(
                                 sourceDeviceId:
                                     deviceId,
 
+                                baseRevision:
+                                    previousRevision,
+
                                 payload: {
-                                    generationId,
+                                    generationId:
+                                        generation.id,
 
                                     status,
+
+                                    generationType:
+                                        generation.type,
                                 },
 
                                 generation:
-                                    oldGeneration,
-
-                                includeSnapshot:
-                                    true,
+                                    finishedGeneration,
                             },
                         );
-
-                    event.revision =
-                        record.revision;
 
                     record.generation =
                         null;
 
-                    broadcast(
-                        record,
+                    const state =
+                        publicState(
+                            record,
+                        );
+
+                    const result = {
+                        accepted:
+                            true,
+
                         event,
+
+                        state,
+                    };
+
+                    rememberOperation(
+                        record,
+                        opId,
+                        result,
                     );
 
-                    await schedulePersist(
+                    await persistScope(
                         record,
                         true,
                     );
 
-                    return ok(
-                        res,
+                    broadcastLiveEvent(
+                        record,
+                        event,
                         {
-                            accepted:
-                                true,
+                            kind:
+                                'full',
 
-                            event,
-
-                            state:
-                                publicState(
-                                    record,
+                            snapshot:
+                                clone(
+                                    record.snapshot,
                                 ),
                         },
                     );
+
+                    return res.json({
+                        ok:
+                            true,
+
+                        ...result,
+                    });
                 }
 
-
-                /* ---------------------------------------------------------- */
-                /* Ordinary state mutation                                     */
-                /* ---------------------------------------------------------- */
-
-                checkBaseRevision(
-                    record,
-                    body,
-                );
 
                 /*
-                 * Non-owner clients cannot mutate chat content while another
-                 * client is generating.
+                 * Bootstrap.
                  */
                 if (
-                    record.generation &&
-                    record.generation.ownerClientId !==
-                        clientId
+                    type ===
+                    'bootstrap'
                 ) {
-                    return httpError(
-                        res,
-                        409,
+                    if (
+                        record.revision !==
+                            0 ||
+                        record.snapshot
+                    ) {
+                        throw new SyncError(
+                            'stale_revision',
+                            'Synchronization scope is already initialized',
+                            409,
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    requireBaseRevision(
+                        record,
+                        baseRevision,
+                    );
+
+                    validateSnapshotShape(
+                        req.body.snapshot,
+                    );
+
+                    validateNoDuplicateMessageIds(
+                        req.body.snapshot,
+                    );
+
+                    validateSnapshotLineage(
+                        req.body.snapshot,
+                        scope,
+                    );
+
+                    const actual =
+                        await readStChatSnapshot(
+                            req,
+                            scope,
+                            {
+                                force:
+                                    true,
+                            },
+                        );
+
+                    const incomingHash =
+                        sha256(
+                            req.body.snapshot,
+                        );
+
+                    if (
+                        actual.exists &&
+                        actual.hash &&
+                        actual.hash !==
+                            incomingHash
+                    ) {
+                        throw new SyncError(
+                            'st_not_persisted',
+                            'Existing SillyTavern chat differs from bootstrap snapshot',
+                            409,
+                            {
+                                expectedHash:
+                                    incomingHash,
+
+                                actualHash:
+                                    actual.hash,
+                            },
+                        );
+                    }
+
+                    record.snapshot =
+                        clone(
+                            req.body.snapshot,
+                        );
+
+                    record.snapshotHash =
+                        incomingHash;
+
+                    record.revision =
+                        1;
+
+                    const event =
+                        appendEvent(
+                            record,
+                            {
+                                type:
+                                    'bootstrap',
+
+                                opId,
+
+                                sourceClientId:
+                                    clientId,
+
+                                sourceDeviceId:
+                                    deviceId,
+
+                                baseRevision:
+                                    0,
+
+                                payload: {},
+                            },
+                        );
+
+                    const state =
+                        publicState(
+                            record,
+                        );
+
+                    const result = {
+                        accepted:
+                            true,
+
+                        event,
+
+                        state,
+                    };
+
+                    rememberOperation(
+                        record,
+                        opId,
+                        result,
+                    );
+
+                    await persistScope(
+                        record,
+                        true,
+                    );
+
+                    broadcastLiveEvent(
+                        record,
+                        event,
+                        {
+                            kind:
+                                'full',
+
+                            snapshot:
+                                clone(
+                                    record.snapshot,
+                                ),
+                        },
+                    );
+
+                    return res.json({
+                        ok:
+                            true,
+
+                        ...result,
+                    });
+                }
+
+
+                /*
+                 * Reconcile an out-of-band local ST save.
+                 */
+                if (
+                    type ===
+                    'reconcile_local'
+                ) {
+                    if (
+                        record.generation
+                    ) {
+                        throw new SyncError(
+                            'generation_lock',
+                            'Cannot reconcile while generation is active',
+                            409,
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    requireBaseRevision(
+                        record,
+                        baseRevision,
+                    );
+
+                    validateSnapshotShape(
+                        req.body.snapshot,
+                    );
+
+                    validateNoDuplicateMessageIds(
+                        req.body.snapshot,
+                    );
+
+                    validateSnapshotLineage(
+                        req.body.snapshot,
+                        scope,
+                    );
+
+                    const actual =
+                        await readStChatSnapshot(
+                            req,
+                            scope,
+                            {
+                                force:
+                                    true,
+                            },
+                        );
+
+                    const incomingHash =
+                        sha256(
+                            req.body.snapshot,
+                        );
+
+                    if (
+                        actual.hash !==
+                        incomingHash
+                    ) {
+                        throw new SyncError(
+                            'st_not_persisted',
+                            'Current SillyTavern file does not match the reconciliation snapshot',
+                            409,
+                            {
+                                expectedHash:
+                                    incomingHash,
+
+                                actualHash:
+                                    actual.hash,
+                            },
+                        );
+                    }
+
+                    const previousRevision =
+                        record.revision;
+
+                    record.snapshot =
+                        clone(
+                            actual.snapshot,
+                        );
+
+                    record.snapshotHash =
+                        actual.hash;
+
+                    record.revision +=
+                        1;
+
+                    const event =
+                        appendEvent(
+                            record,
+                            {
+                                type:
+                                    'state_reconciled',
+
+                                opId,
+
+                                sourceClientId:
+                                    clientId,
+
+                                sourceDeviceId:
+                                    deviceId,
+
+                                baseRevision:
+                                    previousRevision,
+
+                                payload: {
+                                    strategy:
+                                        'current_st_file',
+                                },
+                            },
+                        );
+
+                    const state =
+                        publicState(
+                            record,
+                        );
+
+                    const result = {
+                        accepted:
+                            true,
+
+                        event,
+
+                        state,
+                    };
+
+                    rememberOperation(
+                        record,
+                        opId,
+                        result,
+                    );
+
+                    await persistScope(
+                        record,
+                        true,
+                    );
+
+                    broadcastLiveEvent(
+                        record,
+                        event,
+                        {
+                            kind:
+                                'full',
+
+                            snapshot:
+                                clone(
+                                    record.snapshot,
+                                ),
+                        },
+                    );
+
+                    return res.json({
+                        ok:
+                            true,
+
+                        ...result,
+                    });
+                }
+
+
+                /*
+                 * Ordinary full-state mutation.
+                 *
+                 * Keep the accepted event types explicit so arbitrary remote
+                 * RPC-like commands cannot be smuggled through this endpoint.
+                 */
+                const allowedTypes =
+                    new Set([
+                        'message_sent',
+                        'message_received',
+                        'message_edited',
+                        'message_deleted',
+                        'message_updated',
+
+                        'message_swiped',
+                        'message_swipe_deleted',
+
+                        'message_file_embedded',
+                        'file_attachment_deleted',
+                        'media_attachment_deleted',
+
+                        'message_reasoning_edited',
+                        'message_reasoning_deleted',
+                        'stream_reasoning_done',
+
+                        'tool_calls_performed',
+
+                        'chat_loaded',
+                        'chat_changed',
+                        'chat_created',
+                        'chat_deleted',
+                        'chat_renamed',
+
+                        'group_chat_created',
+                        'group_chat_deleted',
+                        'group_updated',
+
+                        'chat_lifecycle',
+                    ]);
+
+                if (
+                    !allowedTypes.has(
+                        type,
+                    )
+                ) {
+                    throw new SyncError(
+                        'unknown_event_type',
+                        `Unsupported synchronization event type: ${type}`,
+                    );
+                }
+
+                if (
+                    record.generation
+                ) {
+                    throw new SyncError(
                         'generation_lock',
-                        'Chat mutations are locked while another client is generating',
+                        'Chat mutations are locked during active generation',
+                        409,
                         {
                             state:
                                 publicState(
@@ -3341,41 +6097,104 @@ async function init(
                     );
                 }
 
-                const snapshot =
-                    body.snapshot;
-
-                validateSnapshot(
-                    snapshot,
+                requireBaseRevision(
+                    record,
+                    baseRevision,
                 );
 
-                record.snapshot =
-                    clone(
-                        snapshot,
+                validateSnapshotShape(
+                    req.body.snapshot,
+                );
+
+                validateNoDuplicateMessageIds(
+                    req.body.snapshot,
+                );
+
+                validateSnapshotLineage(
+                    req.body.snapshot,
+                    scope,
+                );
+
+                const incomingHash =
+                    sha256(
+                        req.body.snapshot,
                     );
 
+                /*
+                 * Read the user's actual ST chat to prevent the plugin mirror
+                 * from becoming a separate authority for ordinary committed
+                 * chat mutations.
+                 */
+                const actual =
+                    await readStChatSnapshot(
+                        req,
+                        scope,
+                        {
+                            force:
+                                true,
+                        },
+                    );
+
+                if (
+                    !actual.snapshot
+                ) {
+                    throw new SyncError(
+                        'st_not_persisted',
+                        'SillyTavern chat file is not currently available',
+                        409,
+                    );
+                }
+
+                if (
+                    actual.hash !==
+                    incomingHash
+                ) {
+                    throw new SyncError(
+                        'st_not_persisted',
+                        'SillyTavern file does not match submitted synchronization state',
+                        409,
+                        {
+                            expectedHash:
+                                incomingHash,
+
+                            actualHash:
+                                actual.hash,
+                        },
+                    );
+                }
+
+                const previousSnapshot =
+                    record.snapshot
+                        ? clone(
+                            record.snapshot,
+                        )
+                        : null;
+
+                const canonicalSnapshot =
+                    clone(
+                        actual.snapshot,
+                    );
+
+                record.snapshot =
+                    canonicalSnapshot;
+
                 record.snapshotHash =
-                    crypto
-                        .createHash(
-                            'sha256',
-                        )
-                        .update(
-                            stableStringify(
-                                record.snapshot,
-                            ),
-                        )
-                        .digest(
-                            'hex',
-                        );
+                    actual.hash;
 
-                record.revision += 1;
+                const previousRevision =
+                    record.revision;
 
-                rememberOp(
-                    record,
-                    opId,
-                );
+                record.revision +=
+                    1;
+
+                const patch =
+                    makeSnapshotPatch(
+                        previousSnapshot,
+                        record.snapshot,
+                    );
 
                 const event =
-                    makeEvent(
+                    appendEvent(
                         record,
                         {
                             type,
@@ -3388,94 +6207,64 @@ async function init(
                             sourceDeviceId:
                                 deviceId,
 
+                            baseRevision:
+                                previousRevision,
+
                             payload:
                                 clone(
-                                    body.payload ||
-                                    {},
+                                    payload,
                                 ),
 
                             generation:
-                                record.generation,
-
-                            includeSnapshot:
-                                true,
+                                null,
                         },
                     );
 
-                event.revision =
-                    record.revision;
+                const state =
+                    publicState(
+                        record,
+                        {
+                            includeSnapshot:
+                                false,
+                        },
+                    );
 
-                broadcast(
-                    record,
+                const result = {
+                    accepted:
+                        true,
+
                     event,
+
+                    state,
+                };
+
+                rememberOperation(
+                    record,
+                    opId,
+                    result,
                 );
 
-                await schedulePersist(
+                await persistScope(
                     record,
                     true,
                 );
 
-                return ok(
-                    res,
-                    {
-                        accepted:
-                            true,
-
-                        event,
-
-                        state:
-                            publicState(
-                                record,
-                            ),
-                    },
+                broadcastLiveEvent(
+                    record,
+                    event,
+                    patch,
                 );
+
+                return res.json({
+                    ok:
+                        true,
+
+                    ...result,
+                });
             } catch (error) {
-                if (
-                    error.currentState
-                ) {
-                    return httpError(
-                        res,
-                        409,
-
-                        error.code ||
-                            'conflict',
-
-                        error.message,
-
-                        {
-                            state:
-                                error.currentState,
-                        },
-                    );
-                }
-
-                const status =
-                    error.code ===
-                        'not_member' ||
-                    error.code ===
-                        'membership_expired'
-                        ? 403
-                        : error.code ===
-                            'protocol_mismatch'
-                            ? 426
-                            : error.code ===
-                                'snapshot_too_large' ||
-                              error.code ===
-                                'payload_too_large'
-                                ? 413
-                                : error.code ===
-                                    'device_mismatch'
-                                    ? 409
-                                    : 400;
-
-                return httpError(
+                return sendError(
                     res,
-                    status,
-
-                    error.code ||
-                        'invalid_request',
-
-                    error.message,
+                    error,
                 );
             }
         },
@@ -3483,113 +6272,107 @@ async function init(
 
 
     /* ---------------------------------------------------------------------- */
-    /* Server watchdog                                                         */
+    /* WATCHDOG                                                               */
     /* ---------------------------------------------------------------------- */
 
-    scanTimer =
+    watchdogTimer =
         setInterval(
-            () => {
-                const timestamp =
-                    now();
-
-                for (
-                    const record of
-                        scopes.values()
-                ) {
-                    for (
-                        const [
-                            clientId,
-                            member,
-                        ] of record.members
-                    ) {
-                        if (
-                            member.expiresAt <=
-                            timestamp
-                        ) {
-                            record.members.delete(
-                                clientId,
-                            );
-                        }
-                    }
-
-                    expireGeneration(
-                        record,
-                    );
-                }
-            },
-            GENERATION_SCAN_MS,
+            cleanRuntimeState,
+            5_000,
         );
 
+    if (
+        typeof watchdogTimer.unref ===
+        'function'
+    ) {
+        watchdogTimer.unref();
+    }
+
+    initialized =
+        true;
+
     console.log(
-        `[${PLUGIN_ID}] loaded (protocol ${PROTOCOL_VERSION}, epoch ${runtimeEpoch})`,
+        `[${PLUGIN_ID}] loaded: protocol=${PROTOCOL_VERSION}, epoch=${runtimeEpoch}`,
     );
 }
 
 
 /* -------------------------------------------------------------------------- */
-/* Plugin shutdown                                                             */
+/* Shutdown                                                                  */
 /* -------------------------------------------------------------------------- */
 
 async function exit() {
-    if (scanTimer) {
-        clearInterval(
-            scanTimer,
-        );
-    }
+    shuttingDown =
+        true;
 
-    scanTimer =
-        null;
-
-    for (
-        const timer of
-            persistTimers.values()
+    if (
+        watchdogTimer
     ) {
-        clearTimeout(
-            timer,
+        clearInterval(
+            watchdogTimer,
         );
+
+        watchdogTimer =
+            null;
     }
 
-    persistTimers.clear();
-
+    /*
+     * Gracefully tell connected clients to reconnect.
+     */
     for (
-        const clients of
-            sseByScope.values()
+        const [
+            ,
+            clients,
+        ] of sseClients
     ) {
         for (
-            const res of clients
+            const responseSet of
+                clients.values()
         ) {
-            try {
-                sendSse(
-                    res,
-                    'shutdown',
-                    {
-                        reason:
-                            'server_shutdown',
+            for (
+                const res of
+                    responseSet
+            ) {
+                try {
+                    sendSse(
+                        res,
+                        'shutdown',
+                        {
+                            reason:
+                                'server_shutdown',
 
-                        epoch:
-                            runtimeEpoch,
-                    },
-                );
+                            epoch:
+                                runtimeEpoch,
+                        },
+                    );
 
-                res.end();
-            } catch {
-                // ignored
+                    res.end();
+                } catch {
+                    // ignored
+                }
             }
         }
     }
 
-    sseByScope.clear();
+    sseClients.clear();
 
-    await Promise.all(
+    /*
+     * Flush every scope through its own serialized persistence chain.
+     */
+    await Promise.allSettled(
         [
             ...scopes.values(),
         ].map(
             record =>
                 persistScope(
                     record,
+                    true,
                 ),
         ),
     );
+
+    initialized =
+        false;
 
     console.log(
         `[${PLUGIN_ID}] unloaded`,
@@ -3598,7 +6381,7 @@ async function exit() {
 
 
 /* -------------------------------------------------------------------------- */
-/* Exports                                                                     */
+/* Exports                                                                    */
 /* -------------------------------------------------------------------------- */
 
 module.exports = {
