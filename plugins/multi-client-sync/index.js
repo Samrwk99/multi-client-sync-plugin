@@ -51,7 +51,12 @@ function requireAuth(req, res) {
     return true;
 }
 function scopeKey(scope) {
-    return [scope.kind, scope.ownerId, scope.chatId, scope.branchId || ''].join('|');
+    return JSON.stringify([
+        String(scope?.kind || ''),
+        String(scope?.ownerId || ''),
+        String(scope?.chatId || ''),
+        String(scope?.branchId || ''),
+    ]);
 }
 function validateScope(scope) {
     if (!isObject(scope)) return 'invalid_scope';
@@ -142,12 +147,22 @@ async function loadState(req, scope) {
 async function persistState(req, scope, state) {
     const file = statePath(req, scope);
     await ensureDir(path.dirname(file));
+
     const projected = clone(state);
     projected.updatedAt = now();
+
+    // Stream events are intentionally transient. The current live generation
+    // remains in memory and is delivered to connected SSE clients, while the
+    // durable file only stores non-stream history and durable checkpoints.
+    if (Array.isArray(projected.events)) {
+        projected.events = projected.events.filter(event => event?.type !== 'generation_stream');
+    }
+
     const payload = JSON.stringify(projected);
     if (Buffer.byteLength(payload, 'utf8') > LIMITS.maxSnapshotBytes + 2 * 1024 * 1024) {
         throw Object.assign(new Error('state_too_large'), { code: 'state_too_large' });
     }
+
     const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
     await fsp.writeFile(tmp, payload, { mode: 0o600 });
     await fsp.rename(tmp, file);
@@ -171,13 +186,34 @@ async function withLock(req, scope, fn) {
         release();
     }
 }
+function pruneExpiredMembers(skey) {
+    const map = subscribers.get(skey);
+    if (!map) return null;
+
+    const cutoff = now() - LIMITS.memberTtlMs;
+    for (const [clientId, entry] of map.entries()) {
+        if (!entry?.member || Number(entry.member.lastSeenAt || 0) < cutoff) {
+            map.delete(clientId);
+        }
+    }
+
+    if (map.size === 0) {
+        subscribers.delete(skey);
+        return null;
+    }
+
+    return map;
+}
+
 function activeMembers(req, scope) {
-    const map = subscribers.get(`${userKey(req)}::${scopeKey(scope)}`);
+    const skey = `${userKey(req)}::${scopeKey(scope)}`;
+    const map = pruneExpiredMembers(skey);
     if (!map) return [];
     return [...map.values()].map(x => x.member);
 }
 function isMember(req, scope, clientId, deviceId) {
-    const map = subscribers.get(`${userKey(req)}::${scopeKey(scope)}`);
+    const skey = `${userKey(req)}::${scopeKey(scope)}`;
+    const map = pruneExpiredMembers(skey);
     const member = map?.get(clientId)?.member;
     if (!member) return false;
     if (member.deviceId !== deviceId) return false;
@@ -203,7 +239,13 @@ function rememberOp(state, opId) {
 }
 function hasOp(state, opId) { return !!opId && state.recentOps.includes(opId); }
 function revisionError(state) {
-    return { ok: false, error: 'revision_conflict', revision: state.revision, snapshot: clone(state.snapshot), generation: clone(state.generation) };
+    return {
+        ok: false,
+        error: 'revision_conflict',
+        revision: state.revision,
+        snapshot: clone(state.snapshot),
+        generation: generationPublic(state.generation),
+    };
 }
 function bumpRevision(state) { state.revision += 1; state.updatedAt = now(); }
 function pushEvent(state, event) {
@@ -247,8 +289,9 @@ function publicState(state) {
         updatedAt: state.updatedAt,
     };
 }
-function generationPublic(g) {
-    return g ? {
+function generationPublic(g, includeMessage = true) {
+    if (!g) return null;
+    const value = {
         generationId: g.generationId,
         clientId: g.clientId,
         deviceId: g.deviceId,
@@ -259,9 +302,10 @@ function generationPublic(g) {
         seq: g.seq,
         messageId: g.messageId || null,
         messageIndex: Number.isInteger(g.messageIndex) ? g.messageIndex : null,
-        message: g.message ? clone(g.message) : null,
         stopRequested: !!g.stopRequested,
-    } : null;
+    };
+    if (includeMessage) value.message = g.message ? clone(g.message) : null;
+    return value;
 }
 function expireGeneration(state) {
     if (!state.generation) return false;
@@ -321,9 +365,14 @@ async function handleJoin(req, res) {
     if (!jsonSafeId(clientId) || !jsonSafeId(deviceId)) return res.status(400).json({ ok: false, error: 'invalid_client' });
 
     const skey = `${userKey(req)}::${scopeKey(scope)}`;
-    let set = subscribers.get(skey);
-    if (!set) { set = new Map(); subscribers.set(skey, set); }
-    if (set.size > LIMITS.maxSubscribersPerScope && !set.has(clientId)) return res.status(429).json({ ok: false, error: 'too_many_clients' });
+    let set = pruneExpiredMembers(skey);
+    if (!set) {
+        set = new Map();
+        subscribers.set(skey, set);
+    }
+    if (set.size >= LIMITS.maxSubscribersPerScope && !set.has(clientId)) {
+        return res.status(429).json({ ok: false, error: 'too_many_clients' });
+    }
 
     const existing = set.get(clientId)?.member;
     if (existing && existing.deviceId !== deviceId && now() - existing.lastSeenAt <= LIMITS.memberTtlMs) {
@@ -333,7 +382,7 @@ async function handleJoin(req, res) {
     const release = await lockFor(skey);
     try {
         const state = await loadState(req, scope);
-        if (state.revision === 0 && body.snapshot) {
+        if (state.revision === 0 && set.size === 0 && body.snapshot) {
             try {
                 state.snapshot = canonicalSnapshot(body.snapshot);
             } catch (e) {
@@ -433,8 +482,12 @@ async function handleSnapshot(req, res) {
             const recoveryEvent = pushEvent(state, { type: 'generation_recovered', generation: null });
             publish(req, scope, recoveryEvent);
         }
-        if (state.generation && state.generation.phase === 'streaming') {
-            return res.status(409).json({ ok: false, error: 'generation_active', state: publicState(state) });
+        if (state.generation) {
+            return res.status(409).json({
+                ok: false,
+                error: 'generation_active',
+                state: publicState(state),
+            });
         }
         if (Number(body.baseRevision) !== state.revision) return res.status(409).json(revisionError(state));
 
@@ -502,35 +555,64 @@ async function handleGenerationUpdate(req, res, kind) {
     if (!member) return;
 
     return withLock(req, scope, async state => {
-        if (!state.generation || !generationOwner(state.generation, body)) return res.status(409).json({ ok: false, error: 'generation_not_owned', state: publicState(state) });
-        if (expireGeneration(state)) return res.status(409).json({ ok: false, error: 'generation_expired', state: publicState(state) });
+        if (!state.generation || !generationOwner(state.generation, body)) {
+            return res.status(409).json({ ok: false, error: 'generation_not_owned', state: publicState(state) });
+        }
+
+        if (expireGeneration(state)) {
+            return res.status(409).json({ ok: false, error: 'generation_expired', state: publicState(state) });
+        }
+
         const g = state.generation;
 
         if (kind === 'heartbeat') {
             g.lastHeartbeat = now();
             g.leaseUntil = now() + LIMITS.generationLeaseMs;
-            await persistState(req, scope, state);
-            return res.json({ ok: true, state: publicState(state) });
+            return res.json({
+                ok: true,
+                state: publicState(state),
+                stopRequested: !!g.stopRequested,
+            });
         }
 
         if (kind === 'started') {
             g.phase = 'started';
             g.startedAt = g.startedAt || now();
+            g.lastHeartbeat = now();
             g.leaseUntil = now() + LIMITS.generationLeaseMs;
-            const event = pushEvent(state, { type: 'generation_started', generation: generationPublic(g) });
+            const event = pushEvent(state, {
+                type: 'generation_started',
+                generation: generationPublic(g, false),
+            });
             await persistState(req, scope, state);
             publish(req, scope, event);
             return res.json({ ok: true, state: publicState(state) });
         }
 
         if (kind === 'stream') {
-            if (!['started', 'streaming'].includes(g.phase)) return res.status(409).json({ ok: false, error: 'generation_not_started' });
+            if (!['started', 'streaming'].includes(g.phase)) {
+                return res.status(409).json({ ok: false, error: 'generation_not_started' });
+            }
+
             const seq = Number(body.seq);
-            if (!Number.isInteger(seq) || seq !== g.seq + 1) return res.status(409).json({ ok: false, error: 'stream_sequence_conflict', expected: g.seq + 1 });
+            if (!Number.isInteger(seq) || seq !== g.seq + 1) {
+                return res.status(409).json({
+                    ok: false,
+                    error: 'stream_sequence_conflict',
+                    expected: g.seq + 1,
+                });
+            }
+
             const message = clone(body.message);
-            if (!isObject(message)) return res.status(400).json({ ok: false, error: 'stream_message_required' });
+            if (!isObject(message)) {
+                return res.status(400).json({ ok: false, error: 'stream_message_required' });
+            }
+
             const id = message?.extra?.multi_client_sync?.messageId;
-            if (!jsonSafeId(String(id || ''))) return res.status(400).json({ ok: false, error: 'message_ids_required' });
+            if (!jsonSafeId(String(id || ''))) {
+                return res.status(400).json({ ok: false, error: 'message_ids_required' });
+            }
+
             g.phase = 'streaming';
             g.lastHeartbeat = now();
             g.leaseUntil = now() + LIMITS.generationLeaseMs;
@@ -538,25 +620,55 @@ async function handleGenerationUpdate(req, res, kind) {
             g.messageId = id;
             g.messageIndex = Number.isInteger(body.messageIndex) ? body.messageIndex : null;
             g.message = message;
-            const live = pushEvent(state, {
-                type: 'generation_stream', generation: generationPublic(g), message, messageIndex: g.messageIndex, seq,
+
+            const event = pushEvent(state, {
+                type: 'generation_stream',
+                generation: generationPublic(g, false),
+                messageIndex: g.messageIndex,
+                seq,
             });
-            await persistState(req, scope, state);
-            publish(req, scope, { ...live, message });
-            return res.json({ ok: true, state: publicState(state) });
+
+            // The live message is intentionally not stored in the durable event
+            // log; it is attached only to this live SSE publication.
+            publish(req, scope, { ...event, message });
+
+            return res.json({
+                ok: true,
+                state: publicState(state),
+                stopRequested: !!g.stopRequested,
+            });
         }
 
         if (kind === 'terminal') {
-            const snap = canonicalSnapshot(body.snapshot);
-            if (bytes(snap) > LIMITS.maxSnapshotBytes) return res.status(413).json({ ok: false, error: 'snapshot_too_large' });
+            let snap;
+            try {
+                snap = canonicalSnapshot(body.snapshot);
+            } catch (error) {
+                return res.status(400).json({ ok: false, error: error.message });
+            }
+
+            if (bytes(snap) > LIMITS.maxSnapshotBytes) {
+                return res.status(413).json({ ok: false, error: 'snapshot_too_large' });
+            }
+
             state.snapshot = snap;
             bumpRevision(state);
-            const finished = generationPublic(g);
+
+            const finished = generationPublic(g, false);
             finished.phase = String(body.phase || 'completed');
-            const event = pushEvent(state, { type: 'generation_terminal', generation: { ...finished, message: clone(g.message) }, revision: state.revision, snapshot: snap });
+
+            const event = pushEvent(state, {
+                type: 'generation_terminal',
+                generation: finished,
+                revision: state.revision,
+                snapshot: snap,
+            });
+
             state.generation = null;
+
             await persistState(req, scope, state);
             publish(req, scope, event);
+
             return res.json({ ok: true, state: publicState(state) });
         }
 
@@ -589,24 +701,48 @@ async function handleGenerationStopRequest(req, res) {
 
 async function handleSse(req, res) {
     if (!req?.user) return res.status(401).end();
+
     let scope;
     try {
-        scope = JSON.parse(Buffer.from(String(req.query?.scope || ''), 'base64url').toString('utf8'));
+        scope = JSON.parse(
+            Buffer.from(
+                String(req.query?.scope || ''),
+                'base64url',
+            ).toString('utf8')
+        );
     } catch {
         return res.status(400).end();
     }
+
     const scopeError = validateScope(scope);
     if (scopeError) return res.status(400).end();
+
     const clientId = String(req.query?.clientId || '');
     const deviceId = String(req.query?.deviceId || '');
-    if (!jsonSafeId(clientId) || !jsonSafeId(deviceId)) return res.status(400).end();
-    if (!isMember(req, scope, clientId, deviceId)) return res.status(403).end();
+
+    if (!jsonSafeId(clientId) || !jsonSafeId(deviceId)) {
+        return res.status(400).end();
+    }
+
+    if (!isMember(req, scope, clientId, deviceId)) {
+        return res.status(403).end();
+    }
 
     const state = await loadState(req, scope);
     const skey = `${userKey(req)}::${scopeKey(scope)}`;
-    let set = subscribers.get(skey);
-    if (!set) { set = new Map(); subscribers.set(skey, set); }
-    if (set.size >= LIMITS.maxSubscribersPerScope && !set.has(clientId)) return res.status(429).end();
+
+    let set = pruneExpiredMembers(skey);
+    if (!set) {
+        set = new Map();
+        subscribers.set(skey, set);
+    }
+
+    if (
+        set.size >= LIMITS.maxSubscribersPerScope &&
+        !set.has(clientId)
+    ) {
+        return res.status(429).end();
+    }
 
     res.status(200);
     res.setHeader('Content-Type', 'text/event-stream');
@@ -614,34 +750,76 @@ async function handleSse(req, res) {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
-    const lastId = Number(req.get('last-event-id') || req.query?.lastEventId || 0);
+    const lastId = Number(
+        req.get('last-event-id') ||
+        req.query?.lastEventId ||
+        0
+    );
+
     sendSse(res, {
-        type: 'hello', protocol: PROTOCOL, schema: SCHEMA, revision: state.revision, generation: generationPublic(state.generation), scope: clone(scope), members: publicMembers(req, scope),
+        type: 'hello',
+        protocol: PROTOCOL,
+        schema: SCHEMA,
+        revision: state.revision,
+        generation: generationPublic(state.generation),
+        scope: clone(scope),
+        members: publicMembers(req, scope),
     });
 
     if (Number.isInteger(lastId) && lastId > 0) {
         const oldest = state.events[0]?.id || state.nextEventId;
+
         if (lastId < oldest - 1) {
-            sendSse(res, { type: 'resync_required', revision: state.revision });
+            sendSse(res, {
+                type: 'resync_required',
+                revision: state.revision,
+            });
         } else {
-            for (const event of state.events) if (event.id > lastId) sendSse(res, event, event.id);
-            sendSse(res, { type: 'replay_complete', revision: state.revision });
+            for (const event of state.events) {
+                if (event.id > lastId) {
+                    sendSse(res, event, event.id);
+                }
+            }
+
+            sendSse(res, {
+                type: 'replay_complete',
+                revision: state.revision,
+            });
         }
     }
 
-    const member = set.get(clientId)?.member;
-    if (member && member.deviceId === deviceId) member.lastSeenAt = now();
-    const sub = { res, member: { clientId, deviceId } };
-    set.set(clientId, sub);
+    const existing = set.get(clientId)?.member;
+    const member = existing && existing.deviceId === deviceId
+        ? existing
+        : {
+            clientId,
+            deviceId,
+            joinedAt: now(),
+        };
+
+    member.lastSeenAt = now();
+
+    set.set(clientId, {
+        res,
+        member,
+    });
 
     const timer = setInterval(() => {
-        try { res.write(': keepalive\n\n'); } catch { clearInterval(timer); }
+        try {
+            res.write(': keepalive\n\n');
+        } catch {
+            clearInterval(timer);
+        }
     }, 15_000);
+
     req.on('close', () => {
         clearInterval(timer);
         const current = set.get(clientId);
         if (current?.res === res) {
-            set.set(clientId, { ...current, res: null });
+            set.set(clientId, {
+                ...current,
+                res: null,
+            });
         }
     });
 }
