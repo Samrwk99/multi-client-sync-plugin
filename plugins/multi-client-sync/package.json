@@ -1,0 +1,7 @@
+{
+  "name": "sillytavern-multi-client-sync",
+  "version": "1.0.0",
+  "description": "Server plugin for Multi-Client Chat Synchronization in SillyTavern",
+  "main": "index.js",
+  "license": "AGPL-3.0"
+}
