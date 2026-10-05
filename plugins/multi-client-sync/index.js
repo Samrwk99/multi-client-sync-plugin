@@ -28,7 +28,7 @@ const LIMITS = Object.freeze({
     maxToolInvocationsPerMessage: 128,
 
     maxEvents: 256,
-    maxTombstones: 4_000,
+    maxTombstones: 32_768,
     maxRecentOps: 4_096,
     maxBranches: 1_024,
     maxLiveGenerationMessages: 64,
@@ -49,6 +49,8 @@ const LIMITS = Object.freeze({
     memberTtlMs: 45_000,
     generationLeaseMs: 15_000,
     generationMaxMs: 30 * 60_000,
+    generationRecoveryTtlMs: 60 * 60_000,
+    recentOpsTtlMs: 24 * 60 * 60_000,
 
     staleTempMs: 10 * 60_000,
     staleStateMs: 30 * 24 * 60 * 60_000,
@@ -84,6 +86,7 @@ const stateLoads = new Map();
 let totalSseConnections = 0;
 let shuttingDown = false;
 let cleanupTimer = null;
+let cleanupRunning = false;
 const LIVE_GENERATION_PERSIST_INTERVAL_MS = 1_000;
 let serverInstanceId = '';
 
@@ -100,6 +103,10 @@ function canonicalize(value, seen = new WeakSet()) {
     }
     if (typeof value !== 'object') throw new Error('Unsupported non-JSON value');
     if (seen.has(value)) throw new Error('Cyclic value is not JSON-compatible');
+    if (!Array.isArray(value)) {
+        const prototype = Object.getPrototypeOf(value);
+        if (prototype !== Object.prototype && prototype !== null) throw new Error('Unsupported object prototype');
+    }
     seen.add(value);
     try {
         if (Array.isArray(value)) return value.map(item => canonicalize(item, seen));
@@ -182,17 +189,25 @@ function validateDataTree(value, depth = 0, seen = new WeakSet()) {
     if (typeof value !== 'object') return false;
     if (seen.has(value)) return false;
     seen.add(value);
-    if (Array.isArray(value)) return value.every(child => validateDataTree(child, depth + 1, seen));
-    for (const [key, child] of Object.entries(value)) {
-        if (FORBIDDEN_KEYS.has(key)) return false;
-        if (!validateDataTree(child, depth + 1, seen)) return false;
+    try {
+        if (Array.isArray(value)) return value.every(child => validateDataTree(child, depth + 1, seen));
+        for (const [key, child] of Object.entries(value)) {
+            if (FORBIDDEN_KEYS.has(key)) return false;
+            if (!validateDataTree(child, depth + 1, seen)) return false;
+        }
+        return true;
+    } finally {
+        seen.delete(value);
     }
-    return true;
 }
 
 function validateAttachment(attachment) {
     if (!isObject(attachment)) return false;
-    if (attachment.url !== undefined && (typeof attachment.url !== 'string' || attachment.url.length > 4096)) return false;
+    if (attachment.url !== undefined) {
+        if (typeof attachment.url !== 'string' || attachment.url.length > 4096) return false;
+        const urlScheme = attachment.url.trim().match(/^([a-z][a-z0-9+.-]*):/i)?.[1]?.toLowerCase();
+        if (urlScheme && ['javascript', 'vbscript', 'file'].includes(urlScheme)) return false;
+    }
     if (attachment.name !== undefined && (typeof attachment.name !== 'string' || attachment.name.length > 1024)) return false;
     if (attachment.text !== undefined && (typeof attachment.text !== 'string' || attachment.text.length > 1_500_000)) return false;
     if (attachment.size !== undefined && (!Number.isFinite(Number(attachment.size)) || Number(attachment.size) < 0)) return false;
@@ -345,13 +360,16 @@ function emptyState(scope) {
         pendingGenerationRecovery: null,
         serverInstanceId,
         groupSettings: null,
+        hostGroupSettingsDigest: null,
         branches: [],
         createdAt: now(),
         updatedAt: now(),
         hostSnapshotDigest: null,
         hostMetadataDigest: sha256(canonicalJson({})),
+        hostMessageIdsPending: false,
         renamedTo: null,
         deleted: false,
+        recoveredFromInvalidState: false,
     };
 }
 
@@ -370,10 +388,10 @@ async function loadJson(file) {
     return result.ok ? result.value : null;
 }
 
-async function quarantineStateFile(file) {
+async function quarantineStateFile(file, label = 'corrupt') {
     try {
         const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const target = `${file}.corrupt.${stamp}`;
+        const target = `${file}.${label}.${stamp}.${randomId('q_').slice(2, 18)}`;
         await fsp.rename(file, target);
         return target;
     } catch {
@@ -382,14 +400,20 @@ async function quarantineStateFile(file) {
 }
 
 async function atomicWrite(file, value) {
-    const content = JSON.stringify(value);
+    const content = canonicalJson(value);
     if (Buffer.byteLength(content, 'utf8') > LIMITS.maxPersistedStateBytes) throw new Error('Persisted synchronization state is too large');
     await fsp.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
     const temp = `${file}.${process.pid}.${randomId('tmp_')}.tmp`;
+    let handle = null;
     try {
-        await fsp.writeFile(temp, content, { encoding: 'utf8', mode: 0o600 });
+        handle = await fsp.open(temp, 'w', 0o600);
+        await handle.writeFile(content, 'utf8');
+        await handle.sync();
+        await handle.close();
+        handle = null;
         await fsp.rename(temp, file);
     } finally {
+        if (handle) await handle.close().catch(() => {});
         await fsp.rm(temp, { force: true }).catch(() => {});
     }
 }
@@ -453,22 +477,34 @@ function expireGeneration(state) {
 function pruneState(state) {
     if (!Array.isArray(state.events)) state.events = [];
     if (state.events.length > LIMITS.maxEvents) state.events.splice(0, state.events.length - LIMITS.maxEvents);
+
     if (!Array.isArray(state.tombstones)) state.tombstones = [];
+    // Tombstones are a safety mechanism against resurrection during offline rebases.
+    // Do not prune them merely because a client advertises a revision: a client can
+    // be stale, buggy, or malicious and server revisions do not prove deletion delivery.
     if (state.tombstones.length > LIMITS.maxTombstones) state.tombstones.splice(0, state.tombstones.length - LIMITS.maxTombstones);
+
     if (!Array.isArray(state.recentOps)) state.recentOps = [];
+    const opCutoff = now() - LIMITS.recentOpsTtlMs;
+    state.recentOps = state.recentOps.filter(item => Number(item.storedAt || 0) >= opCutoff);
     if (state.recentOps.length > LIMITS.maxRecentOps) state.recentOps.splice(0, state.recentOps.length - LIMITS.maxRecentOps);
+
     if (!Array.isArray(state.snapshot)) state.snapshot = [];
     if (!isObject(state.chatMetadata)) state.chatMetadata = {};
     if (!Array.isArray(state.branches)) state.branches = [];
     if (state.branches.length > LIMITS.maxBranches) state.branches.splice(0, state.branches.length - LIMITS.maxBranches);
     if (state.recoverableGeneration !== null && state.recoverableGeneration !== undefined && !isObject(state.recoverableGeneration)) state.recoverableGeneration = null;
+    if (state.recoverableGeneration?.expiredAt && Number(state.recoverableGeneration.expiredAt) + LIMITS.generationRecoveryTtlMs < now()) state.recoverableGeneration = null;
     if (state.pendingGenerationRecovery !== null && state.pendingGenerationRecovery !== undefined && !isObject(state.pendingGenerationRecovery)) state.pendingGenerationRecovery = null;
     if (!state.serverInstanceId) state.serverInstanceId = serverInstanceId;
     if (!Number.isInteger(state.revision) || state.revision < 0) state.revision = 0;
     if (!state.epoch) state.epoch = randomId('e_');
-    if (state.hostMetadataDigest == null) state.hostMetadataDigest = sha256(canonicalJson(state.chatMetadata || {}));
+    if (state.hostMetadataDigest == null) state.hostMetadataDigest = metadataDigest(state.chatMetadata || {});
+    if (state.hostGroupSettingsDigest === undefined) state.hostGroupSettingsDigest = null;
+    state.hostMessageIdsPending = !!state.hostMessageIdsPending;
     if (state.renamedTo !== null && state.renamedTo !== undefined && !isObject(state.renamedTo)) state.renamedTo = null;
     state.deleted = !!state.deleted;
+    state.recoveredFromInvalidState = !!state.recoveredFromInvalidState;
 
     ensureGenerationShape(state);
 
@@ -495,22 +531,69 @@ async function loadState(req, scope) {
         await ensureStateRoot(req);
         const file = storageFile(req, scope);
         stateFiles.set(key, file);
-        const read = await loadJsonDetailed(file);
+        let read = await loadJsonDetailed(file);
+
+        // Migrate state written by the earlier protocol where branchId/parentChatId
+        // were part of the filename key. The current scope identity is chat-file based,
+        // so the exact legacy hash can be reconstructed without scanning the directory.
+        if (!read.exists) {
+            const legacyScopeKey = [
+                scope.userId,
+                scope.kind,
+                scope.kind === 'character' ? scope.character : scope.groupId,
+                scope.chatId,
+                scope.branchId || 'main',
+            ].join('|');
+            const legacyFile = safeJoin(
+                stateRootFromRequest(req),
+                `${sha256(legacyScopeKey).slice(0, 40)}.json`,
+            );
+            if (legacyFile !== file) {
+                const legacyRead = await loadJsonDetailed(legacyFile);
+                if (legacyRead.ok && isObject(legacyRead.value) && isObject(legacyRead.value.scope)
+                    && legacyRead.value.scope.userId === scope.userId
+                    && legacyRead.value.scope.kind === scope.kind
+                    && (scope.kind === 'character'
+                        ? legacyRead.value.scope.character === scope.character
+                        : legacyRead.value.scope.groupId === scope.groupId)
+                    && String(legacyRead.value.scope.chatId || '') === String(scope.chatId)) {
+                    read = legacyRead;
+                    try {
+                        await fsp.rename(legacyFile, file);
+                    } catch {}
+                }
+            }
+        }
+
         let state;
+        let recoveredFromInvalidState = false;
         if (!read.exists) {
             state = emptyState(scope);
-        } else if (!read.ok || !stateIdentityValid(read.value, scope)) {
-            if (read.ok) {
-                state = emptyState(scope);
-            } else {
-                await quarantineStateFile(file);
-                state = emptyState(scope);
-            }
+        } else if (!read.ok) {
+            await quarantineStateFile(file, 'corrupt');
+            state = emptyState(scope);
+            recoveredFromInvalidState = true;
+        } else if (!isObject(read.value)) {
+            await quarantineStateFile(file, 'incompatible');
+            state = emptyState(scope);
+            recoveredFromInvalidState = true;
         } else {
             state = read.value;
-            if (!validateSnapshot(state.snapshot).ok || !validateMetadata(state.chatMetadata).ok) {
-                await quarantineStateFile(file);
+            const legacyCompatible = state.protocol <= PROTOCOL
+                && state.schema <= SCHEMA
+                && isObject(state.scope)
+                && scopeKey(state.scope) === scopeKey(scope);
+            if (!legacyCompatible || !validateSnapshot(state.snapshot).ok || !validateMetadata(state.chatMetadata).ok) {
+                await quarantineStateFile(file, legacyCompatible ? 'corrupt' : 'incompatible');
                 state = emptyState(scope);
+                recoveredFromInvalidState = true;
+            } else {
+                state.protocol = PROTOCOL;
+                state.schema = SCHEMA;
+                state.scope = clone(scope);
+                state.hostSnapshotDigest = state.hostSnapshotDigest || null;
+                state.hostMetadataDigest = state.hostMetadataDigest || metadataDigest(state.chatMetadata || {});
+                state.serverInstanceId = state.serverInstanceId || null;
             }
         }
         if (state.generation && state.serverInstanceId && state.serverInstanceId !== serverInstanceId) {
@@ -523,6 +606,7 @@ async function loadState(req, scope) {
             state.generation = null;
         }
         state.serverInstanceId = serverInstanceId;
+        state.recoveredFromInvalidState = !!recoveredFromInvalidState;
         state.scope = clone(scope);
         if (state.hostMetadataDigest == null) state.hostMetadataDigest = sha256(canonicalJson(state.chatMetadata || {}));
         pruneState(state);
@@ -585,14 +669,13 @@ function persistState(req, scope, state) {
     pruneState(snapshot);
 
     const next = Promise.all([previousScope, previousUser])
-        .catch(() => {})
         .then(async () => {
             const root = await ensureStateRoot(req);
             const file = stateFiles.get(key) || storageFile(req, scope);
             stateFiles.set(key, file);
             const currentBytes = await calculateUserStateBytes(req);
             const existing = await fsp.stat(file).catch(() => null);
-            const content = JSON.stringify(snapshot);
+            const content = canonicalJson(snapshot);
             const size = Buffer.byteLength(content, 'utf8');
             const projected = Math.max(0, currentBytes - Number(existing?.size || 0)) + size;
             if (projected > LIMITS.maxPersistedBytesPerUser) throw new Error('Synchronization storage quota exceeded');
@@ -620,7 +703,7 @@ async function calculateUserStateBytes(req) {
     try {
         const entries = await fsp.readdir(root, { withFileTypes: true });
         for (const entry of entries) {
-            if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+            if (!entry.isFile() || !(entry.name.endsWith('.json') || entry.name.includes('.corrupt.') || entry.name.includes('.incompatible.'))) continue;
             const stat = await fsp.stat(path.join(root, entry.name)).catch(() => null);
             total += Number(stat?.size || 0);
             if (total > LIMITS.maxPersistedBytesPerUser) break;
@@ -649,12 +732,16 @@ async function cleanupUserState(req) {
             if (stat && stat.mtimeMs < now() - LIMITS.staleTempMs) await fsp.rm(file, { force: true }).catch(() => {});
             continue;
         }
-        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+        if (!entry.isFile() || !(entry.name.endsWith('.json') || entry.name.includes('.corrupt.') || entry.name.includes('.incompatible.'))) continue;
         const stat = await fsp.stat(file).catch(() => null);
         if (!stat || stat.mtimeMs >= cutoff) continue;
+        if (entry.name.includes('.corrupt.') || entry.name.includes('.incompatible.')) {
+            await fsp.rm(file, { force: true }).catch(() => {});
+            continue;
+        }
         const read = await loadJsonDetailed(file);
         if (!read.ok) {
-            await quarantineStateFile(file).catch(() => {});
+            await quarantineStateFile(file, 'corrupt').catch(() => {});
             continue;
         }
         const state = read.value;
@@ -692,8 +779,17 @@ function touchMember(scope, body, { allowReplaceExpired = false } = {}) {
         deviceId,
         connectedAt: existing?.deviceId === deviceId ? existing.connectedAt : now(),
         lastSeen: now(),
+        lastRevision: Number(existing?.lastRevision || 0),
     });
     return { clientId, deviceId };
+}
+
+function updateMemberRevision(scope, clientId, deviceId, revision) {
+    const member = members.get(scopeKey(scope))?.get(clientId);
+    if (!member || member.deviceId !== deviceId) return;
+    const value = Number(revision);
+    if (Number.isInteger(value) && value >= 0) member.lastRevision = Math.max(Number(member.lastRevision || 0), value);
+    member.lastSeen = now();
 }
 
 function isMember(scope, clientId, deviceId) {
@@ -764,6 +860,8 @@ function serializePublicState(state, { includeSnapshot = true, includeGeneration
         updatedAt: state.updatedAt,
         hostSnapshotDigest: state.hostSnapshotDigest || null,
         hostMetadataDigest: state.hostMetadataDigest || null,
+        hostGroupSettingsDigest: state.hostGroupSettingsDigest || null,
+        hostMessageIdsPending: !!state.hostMessageIdsPending,
         renamedTo: clone(state.renamedTo || null),
         deleted: !!state.deleted,
     };
@@ -913,22 +1011,38 @@ async function validateScopeAgainstHost(req, scope) {
     return { ok: true, file };
 }
 
-function projectSnapshotForDigest(snapshot, mode = 'full') {
-    if (mode !== 'relevant') return clone(snapshot || []);
+function projectSnapshotForDigest(snapshot, mode = 'full', syncBranches = true) {
     const out = clone(snapshot || []);
-    const messageFields = ['swipes', 'swipe_info', 'swipe_id'];
-    const extraFields = ['reasoning', 'reasoning_duration', 'reasoning_signature', 'reasoning_display_text', 'tool_invocations'];
-    for (const message of out) {
-        if (!isObject(message)) continue;
-        if (isObject(message.extra)) delete message.extra.multi_client_sync;
-        for (const key of messageFields) delete message[key];
-        if (isObject(message.extra)) for (const key of extraFields) delete message.extra[key];
+    const stripSyncIds = mode !== 'full';
+    const stripBranches = mode === 'no_branches' || mode === 'minimal' || syncBranches === false;
+    const stripSwipes = mode === 'relevant' || mode === 'minimal';
+    if (stripSyncIds || stripBranches || stripSwipes) {
+        const messageFields = ['swipes', 'swipe_info', 'swipe_id'];
+        const extraFields = ['reasoning', 'reasoning_duration', 'reasoning_signature', 'reasoning_display_text', 'tool_invocations'];
+        for (const message of out) {
+            if (!isObject(message)) continue;
+            if (isObject(message.extra)) {
+                if (stripSyncIds) delete message.extra.multi_client_sync;
+                if (stripBranches) delete message.extra[BRANCH_EXTRA_FIELD];
+            }
+            if (stripSwipes) {
+                for (const key of messageFields) delete message[key];
+                if (isObject(message.extra)) for (const key of extraFields) delete message.extra[key];
+            }
+        }
     }
     return out;
 }
 
-function snapshotDigestForMode(snapshot, mode = 'full') {
-    return sha256(canonicalJson(projectSnapshotForDigest(snapshot, mode)));
+function snapshotDigestForMode(snapshot, mode = 'full', syncBranches = true) {
+    return sha256(canonicalJson(projectSnapshotForDigest(snapshot, mode, syncBranches)));
+}
+
+function syncDigestMode(syncSwipes = true, syncBranches = true) {
+    if (syncSwipes && syncBranches) return 'full';
+    if (syncSwipes && !syncBranches) return 'no_branches';
+    if (!syncSwipes && syncBranches) return 'relevant';
+    return 'minimal';
 }
 
 function metadataDigest(metadata) {
@@ -943,16 +1057,16 @@ function expectedMainChatForChild(parentScope, branchKind) {
 
 async function readHostChat(req, scope) {
     const validation = await validateScopeAgainstHost(req, scope);
-    if (!validation.ok) return { ok: false, exists: false, hash: null, snapshotDigest: null, relevantSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: validation.code };
+    if (!validation.ok) return { ok: false, exists: false, hash: null, snapshotDigest: null, relevantSnapshotDigest: null, noBranchesSnapshotDigest: null, minimalSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: validation.code };
     const file = validation.file;
     let raw;
     try {
         raw = await fsp.readFile(file, 'utf8');
     } catch (error) {
         if (error?.code === 'ENOENT') {
-            return { ok: true, exists: false, hash: null, snapshotDigest: sha256(canonicalJson([])), relevantSnapshotDigest: sha256(canonicalJson([])), metadataDigest: sha256(canonicalJson({})), snapshot: [], metadata: {}, missingMessageIds: false };
+            return { ok: true, exists: false, hash: null, snapshotDigest: sha256(canonicalJson([])), relevantSnapshotDigest: sha256(canonicalJson([])), noBranchesSnapshotDigest: sha256(canonicalJson([])), minimalSnapshotDigest: sha256(canonicalJson([])), metadataDigest: sha256(canonicalJson({})), snapshot: [], metadata: {}, missingMessageIds: false };
         }
-        return { ok: false, exists: true, hash: null, snapshotDigest: null, relevantSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: 'chat_read_failed' };
+        return { ok: false, exists: true, hash: null, snapshotDigest: null, relevantSnapshotDigest: null, noBranchesSnapshotDigest: null, minimalSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: 'chat_read_failed' };
     }
     const hash = sha256(raw);
     const lines = raw.split(/\r?\n/).filter(line => line.trim());
@@ -960,18 +1074,18 @@ async function readHostChat(req, scope) {
     const parsed = [];
     for (const line of lines) {
         try { parsed.push(JSON.parse(line)); } catch {
-            return { ok: false, exists: true, hash, snapshotDigest: null, relevantSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: 'chat_file_corrupt' };
+            return { ok: false, exists: true, hash, snapshotDigest: null, relevantSnapshotDigest: null, noBranchesSnapshotDigest: null, minimalSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: 'chat_file_corrupt' };
         }
     }
-    if (!parsed.length) return { ok: true, exists: true, hash, snapshotDigest: sha256(canonicalJson([])), relevantSnapshotDigest: sha256(canonicalJson([])), metadataDigest: sha256(canonicalJson({})), snapshot: [], metadata: {}, missingMessageIds: false };
+    if (!parsed.length) return { ok: true, exists: true, hash, snapshotDigest: sha256(canonicalJson([])), relevantSnapshotDigest: sha256(canonicalJson([])), noBranchesSnapshotDigest: sha256(canonicalJson([])), minimalSnapshotDigest: sha256(canonicalJson([])), metadataDigest: sha256(canonicalJson({})), snapshot: [], metadata: {}, missingMessageIds: false };
 
     const header = isObject(parsed[0]) ? parsed[0] : {};
     const snapshot = parsed.slice(1);
     const snapshotCheck = validateSnapshot(snapshot);
-    if (!snapshotCheck.ok) return { ok: false, exists: true, hash, snapshotDigest: null, relevantSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: snapshotCheck.error };
+    if (!snapshotCheck.ok) return { ok: false, exists: true, hash, snapshotDigest: null, relevantSnapshotDigest: null, noBranchesSnapshotDigest: null, minimalSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: snapshotCheck.error };
     const metadata = isObject(header.chat_metadata) ? clone(header.chat_metadata) : {};
     const metadataCheck = validateMetadata(metadata);
-    if (!metadataCheck.ok) return { ok: false, exists: true, hash, snapshotDigest: null, relevantSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: metadataCheck.error };
+    if (!metadataCheck.ok) return { ok: false, exists: true, hash, snapshotDigest: null, relevantSnapshotDigest: null, noBranchesSnapshotDigest: null, minimalSnapshotDigest: null, metadataDigest: null, snapshot: [], metadata: {}, missingMessageIds: false, error: metadataCheck.error };
 
     if (scope.branchId) {
         if (!metadata.integrity) return { ok: false, exists: true, hash, snapshotDigest: null, relevantSnapshotDigest: null, metadataDigest: null, snapshot, metadata, missingMessageIds: false, error: 'branch_integrity_missing' };
@@ -987,8 +1101,10 @@ async function readHostChat(req, scope) {
         ok: true,
         exists: true,
         hash,
-        snapshotDigest: sha256(canonicalJson(snapshot)),
-        relevantSnapshotDigest: snapshotDigestForMode(snapshot, 'relevant'),
+        snapshotDigest: snapshotDigestForMode(snapshot, 'full', true),
+        relevantSnapshotDigest: snapshotDigestForMode(snapshot, 'relevant', true),
+        noBranchesSnapshotDigest: snapshotDigestForMode(snapshot, 'no_branches', false),
+        minimalSnapshotDigest: snapshotDigestForMode(snapshot, 'minimal', false),
         metadataDigest: sha256(canonicalJson(metadata)),
         snapshot,
         metadata,
@@ -998,30 +1114,39 @@ async function readHostChat(req, scope) {
 
 const UNSYNCED_MESSAGE_FIELDS = Object.freeze(['swipes', 'swipe_info', 'swipe_id']);
 const UNSYNCED_EXTRA_FIELDS = Object.freeze(['reasoning', 'reasoning_duration', 'reasoning_signature', 'reasoning_display_text', 'tool_invocations']);
+const BRANCH_EXTRA_FIELD = 'branches';
 
-function applySyncPolicy(snapshot, previousSnapshot, syncSwipes = true) {
+function applySyncPolicy(snapshot, previousSnapshot, syncSwipes = true, syncBranches = true) {
     const next = ensureMessageIds(snapshot || []);
-    if (syncSwipes !== false) return next;
+    if (syncSwipes !== false && syncBranches !== false) return next;
     const previousMap = new Map((Array.isArray(previousSnapshot) ? previousSnapshot : []).map(message => [getMessageId(message), message]));
     return next.map(message => {
         const output = clone(message);
         const previous = previousMap.get(getMessageId(message));
-        for (const key of UNSYNCED_MESSAGE_FIELDS) {
-            if (previous && Object.prototype.hasOwnProperty.call(previous, key)) output[key] = clone(previous[key]);
-            else delete output[key];
+        if (syncSwipes === false) {
+            for (const key of UNSYNCED_MESSAGE_FIELDS) {
+                if (previous && Object.prototype.hasOwnProperty.call(previous, key)) output[key] = clone(previous[key]);
+                else delete output[key];
+            }
+            if (!isObject(output.extra)) output.extra = {};
+            for (const key of UNSYNCED_EXTRA_FIELDS) {
+                if (previous?.extra && Object.prototype.hasOwnProperty.call(previous.extra, key)) output.extra[key] = clone(previous.extra[key]);
+                else delete output.extra[key];
+            }
         }
-        if (!isObject(output.extra)) output.extra = {};
-        for (const key of UNSYNCED_EXTRA_FIELDS) {
-            if (previous?.extra && Object.prototype.hasOwnProperty.call(previous.extra, key)) output.extra[key] = clone(previous.extra[key]);
-            else delete output.extra[key];
+        if (syncBranches === false) {
+            if (!isObject(output.extra)) output.extra = {};
+            if (previous?.extra && Object.prototype.hasOwnProperty.call(previous.extra, BRANCH_EXTRA_FIELD)) output.extra[BRANCH_EXTRA_FIELD] = clone(previous.extra[BRANCH_EXTRA_FIELD]);
+            else delete output.extra[BRANCH_EXTRA_FIELD];
         }
         return output;
     });
 }
 
-function snapshotEquivalentForPolicy(a, b, syncSwipes = true) {
-    return canonicalJson(projectSnapshotForDigest(a || [], syncSwipes === false ? 'relevant' : 'full'))
-        === canonicalJson(projectSnapshotForDigest(b || [], syncSwipes === false ? 'relevant' : 'full'));
+function snapshotEquivalentForPolicy(a, b, syncSwipes = true, syncBranches = true) {
+    const mode = syncSwipes === false ? 'relevant' : 'full';
+    return canonicalJson(projectSnapshotForDigest(a || [], mode, syncBranches !== false))
+        === canonicalJson(projectSnapshotForDigest(b || [], mode, syncBranches !== false));
 }
 
 function currentGeneration(state) {
@@ -1046,6 +1171,7 @@ function consumePendingGenerationRecovery(state, source = {}) {
 function recoverExpiredGenerationEvent(state, source = {}, reason = 'expired') {
     const previousGeneration = expireGeneration(state);
     if (!previousGeneration) return null;
+    state.pendingGenerationRecovery = null;
     return recordEvent(state, {
         type: 'generation_recover',
         source: {
@@ -1075,18 +1201,35 @@ function revisionCheck(state, body) {
 function hostDigestCheck(host, body) {
     if (body.hostSnapshotDigest === undefined && body.hostMetadataDigest === undefined) return { ok: true };
     if (!host.ok) return { ok: false, code: 'stale_host', message: 'The SillyTavern chat could not be verified.', currentDigest: host.snapshotDigest, hostError: host.error || null };
-    const mode = body.hostSnapshotDigestMode === 'relevant' ? 'relevant' : 'full';
-    const currentDigest = mode === 'relevant' ? host.relevantSnapshotDigest : host.snapshotDigest;
+    if (body.hostSnapshotDigest !== undefined && host.missingMessageIds) {
+        return { ok: false, code: 'host_message_ids_missing', message: 'The native SillyTavern chat has not yet been normalized with synchronization message IDs.', currentDigest: null };
+    }
+    const mode = ['full', 'relevant', 'no_branches', 'minimal'].includes(body.hostSnapshotDigestMode)
+        ? body.hostSnapshotDigestMode
+        : syncDigestMode(body.syncSwipes !== false, body.syncBranches !== false);
+    const currentDigest = mode === 'relevant'
+        ? host.relevantSnapshotDigest
+        : mode === 'no_branches'
+            ? host.noBranchesSnapshotDigest
+            : mode === 'minimal'
+                ? host.minimalSnapshotDigest
+                : host.snapshotDigest;
     if (body.hostSnapshotDigest !== undefined && currentDigest !== String(body.hostSnapshotDigest)) return { ok: false, code: 'stale_host', message: 'The local SillyTavern chat changed since this operation was created.', currentDigest };
     if (body.hostMetadataDigest !== undefined && String(host.metadataDigest || '') !== String(body.hostMetadataDigest)) return { ok: false, code: 'stale_host_metadata', message: 'The local SillyTavern chat metadata changed since this operation was created.', currentDigest: host.metadataDigest || null };
     return { ok: true };
 }
 
-async function restoreAfterPersistFailure(req, scope, state) {
-    const persisted = await loadJson(storageFile(req, scope));
-    if (stateIdentityValid(persisted, scope)) {
+async function restoreAfterPersistFailure(req, scope, state, backup = null) {
+    if (backup && stateIdentityValid(backup, scope)) {
         Object.keys(state).forEach(key => delete state[key]);
-        Object.assign(state, clone(persisted));
+        Object.assign(state, clone(backup));
+        pruneState(state);
+        return;
+    }
+    const read = await loadJsonDetailed(storageFile(req, scope));
+    if (read.ok && stateIdentityValid(read.value, scope)) {
+        Object.keys(state).forEach(key => delete state[key]);
+        Object.assign(state, clone(read.value));
         pruneState(state);
         return;
     }
@@ -1132,6 +1275,10 @@ function groupSettingsSnapshot(group) {
     return result;
 }
 
+function groupSettingsDigest(groupSettings) {
+    return sha256(canonicalJson(groupSettings || {}));
+}
+
 async function handleJoin(req, res) {
     if (requestBodyTooLarge(req)) return sendError(res, 413, 'request_too_large', 'Request is too large.');
     const userId = userIdFromRequest(req);
@@ -1169,39 +1316,47 @@ async function handleJoin(req, res) {
     try {
         await withScopeLock(scope, async () => {
             const state = await loadState(req, scope);
+            const beforeState = clone(state);
             const pendingRecoveryEvent = consumePendingGenerationRecovery(state, { clientId: 'server', deviceId: 'server' });
             const beforeGeneration = !!state.generation;
             host = await readHostChat(req, scope);
             const recoveryEvent = recoverExpiredGenerationEvent(state, ids, 'expired_on_join');
             const effectiveRecoveryEvent = pendingRecoveryEvent || recoveryEvent;
             let changed = !!effectiveRecoveryEvent;
-            if (scope.kind === 'group' && state.groupSettings === null) {
+            if (scope.kind === 'group') {
                 const definition = await loadGroupDefinition(req, scope.groupId);
-                if (definition) { state.groupSettings = groupSettingsSnapshot(definition); changed = true; }
+                if (definition?.ok) {
+                    const hostGroupSettings = groupSettingsSnapshot(definition.value);
+                    const hostDigest = groupSettingsDigest(hostGroupSettings);
+                    if (state.groupSettings === null) { state.groupSettings = clone(hostGroupSettings); changed = true; }
+                    if (state.hostGroupSettingsDigest !== hostDigest) { state.hostGroupSettingsDigest = hostDigest; changed = true; }
+                }
             }
 
             if (state.revision === 0 && state.snapshot.length === 0 && host.ok && host.exists) {
-                if (host.missingMessageIds) {
-                    // The browser extension must assign persistent sync IDs and save them first.
-                } else {
-                    const normalized = clone(host.snapshot);
-                    state.snapshot = normalized;
+                const normalized = ensureMessageIds(host.snapshot);
+                state.snapshot = normalized;
+                state.hostMessageIdsPending = !!host.missingMessageIds;
                 state.chatMetadata = clone(host.metadata);
                 state.hostSnapshotDigest = snapshotDigestForMode(normalized, 'full');
-                    state.revision = 1;
-                    const event = recordEvent(state, {
+                state.hostMetadataDigest = metadataDigest(state.chatMetadata);
+                state.revision = 1;
+                const event = recordEvent(state, {
                     type: 'bootstrap',
                     source: { clientId: ids.clientId, deviceId: ids.deviceId },
                     patch: { kind: 'replace', start: 0, deleteCount: 0, messages: clone(normalized) },
                     stateDigest: sha256(stableJson(normalized)),
                 });
-                    bootstrapped = true;
-                    changed = true;
-                }
+                bootstrapped = true;
+                changed = true;
             }
 
             if (!beforeGeneration && state.generation) currentGeneration(state);
-            if (changed) await persistState(req, scope, state);
+            if (changed) {
+                try { await persistState(req, scope, state); }
+                catch (error) { await restoreAfterPersistFailure(req, scope, state, beforeState); throw error; }
+            }
+            updateMemberRevision(scope, ids.clientId, ids.deviceId, Number.isInteger(Number(req.body?.lastAppliedRevision)) ? Math.min(Number(req.body.lastAppliedRevision), state.revision) : 0);
             if (effectiveRecoveryEvent) publish(scope, 'sync', { epoch: state.epoch, event: clone(effectiveRecoveryEvent), state: serializePublicState(state) }, effectiveRecoveryEvent.id);
             if (bootstrapped) {
                 const bootstrapEvent = state.events.at(-1);
@@ -1229,10 +1384,11 @@ async function handleJoin(req, res) {
         scope: clone(scope),
         state: serializePublicState(resultState),
         serverNow: now(),
+        serverInstanceId,
         membership: ids,
         subscriptionToken,
         bootstrap: bootstrapped,
-        host: { exists: host?.exists || false, ok: host?.ok !== false, hash: host?.hash || null, snapshotDigest: host?.snapshotDigest || null, relevantSnapshotDigest: host?.relevantSnapshotDigest || null, metadataDigest: host?.metadataDigest || null, missingMessageIds: !!host?.missingMessageIds, error: host?.error || null },
+        host: { exists: host?.exists || false, ok: host?.ok !== false, hash: host?.hash || null, snapshotDigest: host?.snapshotDigest || null, relevantSnapshotDigest: host?.relevantSnapshotDigest || null, noBranchesSnapshotDigest: host?.noBranchesSnapshotDigest || null, minimalSnapshotDigest: host?.minimalSnapshotDigest || null, metadataDigest: host?.metadataDigest || null, groupSettingsDigest: resultState?.hostGroupSettingsDigest || null, missingMessageIds: !!host?.missingMessageIds, messageIdsPending: !!resultState?.hostMessageIdsPending, error: host?.error || null },
         capabilities: {
             sse: true, revisions: true, durableQueue: true, idempotency: true,
             generationLease: true, generationStream: true, resumableGenerationPreview: true,
@@ -1265,13 +1421,14 @@ async function handleHeartbeat(req, res) {
 
     return withScopeLock(scope, async () => {
         const state = await loadState(req, scope);
+        const beforeState = clone(state);
         const recoveryEvent = recoverExpiredGenerationEvent(state, { clientId: 'server', deviceId: 'server' }, 'expired_on_heartbeat');
         if (recoveryEvent) {
             try {
                 await persistState(req, scope, state);
                 publish(scope, 'sync', { epoch: state.epoch, event: recoveryEvent, state: serializePublicState(state) }, recoveryEvent.id);
             } catch (error) {
-                await restoreAfterPersistFailure(req, scope, state);
+                await restoreAfterPersistFailure(req, scope, state, beforeState);
                 return sendError(res, 507, 'persistence_failed', 'Synchronization state could not be recovered.');
             }
         }
@@ -1282,11 +1439,13 @@ async function handleHeartbeat(req, res) {
             state.updatedAt = now();
             renewed = true;
             try { await persistState(req, scope, state); } catch (error) {
-                await restoreAfterPersistFailure(req, scope, state);
+                await restoreAfterPersistFailure(req, scope, state, beforeState);
                 return sendError(res, 507, 'persistence_failed', 'Synchronization state could not be durably persisted.');
             }
         }
-        return res.json({ ok: true, membership: { clientId, deviceId }, renewed, revision: state.revision, epoch: state.epoch, generation: clone(state.generation) });
+        const acknowledgedRevision = Number.isInteger(Number(req.body?.lastAppliedRevision)) ? Math.min(Number(req.body.lastAppliedRevision), state.revision) : Number(members.get(scopeKey(scope))?.get(clientId)?.lastRevision || 0);
+        updateMemberRevision(scope, clientId, deviceId, acknowledgedRevision);
+        return res.json({ ok: true, membership: { clientId, deviceId }, renewed, revision: state.revision, epoch: state.epoch, generation: clone(state.generation), serverInstanceId });
     });
 }
 
@@ -1302,18 +1461,35 @@ async function stateResponse(req, res) {
 
     return withScopeLock(scope, async () => {
         const state = await loadState(req, scope);
+        const beforeState = clone(state);
         const recoveryEvent = recoverExpiredGenerationEvent(state, { clientId: 'server', deviceId: 'server' }, 'expired_on_state');
         if (recoveryEvent) {
-            await persistState(req, scope, state).catch(() => {});
+            try { await persistState(req, scope, state); } catch (error) { await restoreAfterPersistFailure(req, scope, state, beforeState); return sendError(res, 507, 'persistence_failed', 'Synchronization recovery could not be durably persisted.'); }
             publish(scope, 'sync', { epoch: state.epoch, event: clone(recoveryEvent), state: serializePublicState(state) }, recoveryEvent.id);
         }
+        const acknowledgedRevision = Number.isInteger(Number(raw?.lastAppliedRevision)) ? Math.min(Number(raw.lastAppliedRevision), state.revision) : Number(members.get(scopeKey(scope))?.get(clientId)?.lastRevision || 0);
+        updateMemberRevision(scope, clientId, deviceId, acknowledgedRevision);
         const host = await readHostChat(req, scope);
+        const pendingIds = host.ok ? !!host.missingMessageIds : state.hostMessageIdsPending;
+        let hostStateChanged = false;
+        if (state.hostMessageIdsPending !== pendingIds) { state.hostMessageIdsPending = pendingIds; hostStateChanged = true; }
+        if (scope.kind === 'group') {
+            const definition = await loadGroupDefinition(req, scope.groupId);
+            if (definition?.ok) {
+                const digest = groupSettingsDigest(groupSettingsSnapshot(definition.value));
+                if (state.hostGroupSettingsDigest !== digest) { state.hostGroupSettingsDigest = digest; hostStateChanged = true; }
+            }
+        }
+        if (hostStateChanged) {
+            state.updatedAt = now();
+            try { await persistState(req, scope, state); } catch (error) { await restoreAfterPersistFailure(req, scope, state, beforeState); return sendError(res, 507, 'persistence_failed', 'Synchronization state could not be updated.'); }
+        }
         return res.json({
             ok: true,
             protocol: PROTOCOL,
             schema: SCHEMA,
             state: serializePublicState(state),
-            host: { ok: host.ok, exists: host.exists, hash: host.hash, snapshotDigest: host.snapshotDigest, relevantSnapshotDigest: host.relevantSnapshotDigest || null, metadataDigest: host.metadataDigest || null, missingMessageIds: !!host.missingMessageIds, error: host.error || null },
+            host: { ok: host.ok, exists: host.exists, hash: host.hash, snapshotDigest: host.snapshotDigest, relevantSnapshotDigest: host.relevantSnapshotDigest || null, noBranchesSnapshotDigest: host.noBranchesSnapshotDigest || null, minimalSnapshotDigest: host.minimalSnapshotDigest || null, metadataDigest: host.metadataDigest || null, groupSettingsDigest: state.hostGroupSettingsDigest || null, missingMessageIds: !!host.missingMessageIds, error: host.error || null },
             cursor: { epoch: state.epoch, revision: state.revision, lastEventId: Number(state.events.at(-1)?.id || 0), serverInstanceId },
         });
     });
@@ -1344,35 +1520,51 @@ async function handleSse(req, res) {
     });
     res.flushHeaders?.();
 
-    const state = await loadState(req, subscription.scope);
-    const recoveryEvent = recoverExpiredGenerationEvent(state, { clientId: 'server', deviceId: 'server' }, 'expired_on_sse');
-    if (recoveryEvent) {
-        await persistState(req, subscription.scope, state).catch(() => {});
-        publish(subscription.scope, 'sync', { epoch: state.epoch, event: clone(recoveryEvent), state: serializePublicState(state) }, recoveryEvent.id);
+    let state;
+    try {
+        state = await withScopeLock(subscription.scope, async () => {
+            const scopedState = await loadState(req, subscription.scope);
+            const beforeState = clone(scopedState);
+            const recoveryEvent = recoverExpiredGenerationEvent(scopedState, { clientId: 'server', deviceId: 'server' }, 'expired_on_sse');
+            if (recoveryEvent) {
+                try {
+                    await persistState(req, subscription.scope, scopedState);
+                    publish(subscription.scope, 'sync', { epoch: scopedState.epoch, event: clone(recoveryEvent), state: serializePublicState(scopedState) }, recoveryEvent.id);
+                } catch {
+                    await restoreAfterPersistFailure(req, subscription.scope, scopedState, beforeState);
+                    throw Object.assign(new Error('synchronization recovery unavailable'), { code: 'sse_recovery_failed' });
+                }
+            }
+            return scopedState;
+        });
+    } catch (error) {
+        closeSubscription(subscription.token);
+        return res.status(503).end(error?.message || 'synchronization recovery unavailable');
     }
     const lastEventId = Number.parseInt(req.get('Last-Event-ID') || req.query?.lastEventId || '0', 10) || 0;
 
     writeSse(res, 'hello', {
         protocol: PROTOCOL,
         schema: SCHEMA,
+        serverInstanceId,
         epoch: state.epoch,
         revision: state.revision,
         eventId: Number(state.events.at(-1)?.id || 0),
         generation: clone(state.generation),
-        serverInstanceId,
     });
 
     const oldest = Number(state.events[0]?.id || 0);
     if (lastEventId && oldest && lastEventId < oldest - 1) {
-        writeSse(res, 'resync_required', { epoch: state.epoch, revision: state.revision, eventId: oldest, reason: 'replay_window_exhausted' });
+        writeSse(res, 'resync_required', { serverInstanceId, epoch: state.epoch, revision: state.revision, eventId: oldest, reason: 'replay_window_exhausted' });
     } else if (lastEventId) {
         for (const event of state.events) {
             if (Number(event.id) <= lastEventId) continue;
-            writeSse(res, 'replay', { epoch: state.epoch, event: clone(event) }, event.id);
+            writeSse(res, 'replay', { serverInstanceId, epoch: state.epoch, event: clone(event) }, event.id);
         }
     }
 
     writeSse(res, 'replay_complete', {
+        serverInstanceId,
         epoch: state.epoch,
         revision: state.revision,
         eventId: Number(state.events.at(-1)?.id || 0),
@@ -1405,30 +1597,34 @@ async function processSnapshotMutation(req, scope, state, body) {
     if (!revision.ok) return { status: 409, payload: { ok: false, error: revision, generation: clone(state.generation) } };
 
     const host = await readHostChat(req, scope);
+    if (body.hostSnapshotDigest !== undefined && host.missingMessageIds) return { status: 409, payload: { ok: false, error: { code: 'host_message_ids_missing', message: 'Persist synchronization message IDs in the native chat before applying this mutation.' } } };
     const hostCheck = hostDigestCheck(host, body);
     if (!hostCheck.ok) return { status: 409, payload: { ok: false, error: hostCheck, generation: clone(state.generation) } };
 
     const validation = validateSnapshot(body.snapshot);
     if (!validation.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_snapshot', message: validation.error } } };
 
-    const metadata = body.chatMetadata === undefined ? clone(state.chatMetadata) : clone(body.chatMetadata);
+    const metadata = body.syncMetadata === false
+        ? clone(state.chatMetadata)
+        : (body.chatMetadata === undefined ? clone(state.chatMetadata) : clone(body.chatMetadata));
     const metadataCheck = validateMetadata(metadata);
     if (!metadataCheck.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_metadata', message: metadataCheck.error } } };
 
     if (scope.branchId && String(metadata.integrity || '') !== String(scope.branchId)) return { status: 400, payload: { ok: false, error: { code: metadata.integrity ? 'branch_integrity_mismatch' : 'branch_integrity_missing', message: metadata.integrity ? 'Branch integrity does not match this synchronized branch.' : 'Branch integrity metadata is required for this synchronized branch.' } } };
     if (scope.parentChatId && String(metadata.main_chat || '') !== String(scope.parentChatId)) return { status: 400, payload: { ok: false, error: { code: metadata.main_chat ? 'branch_parent_mismatch' : 'branch_parent_missing', message: metadata.main_chat ? 'Branch parent does not match this synchronized scope.' : 'Branch parent metadata is required for this synchronized branch.' } } };
 
-    const next = applySyncPolicy(body.snapshot, state.snapshot, body.syncSwipes !== false);
+    const next = body.syncMessages === false ? clone(state.snapshot) : applySyncPolicy(body.snapshot, state.snapshot, body.syncSwipes !== false, body.syncBranches !== false);
     const previous = clone(state.snapshot);
-    const snapshotChanged = !snapshotEquivalentForPolicy(previous, next, body.syncSwipes !== false);
+    const snapshotChanged = body.syncMessages !== false && !snapshotEquivalentForPolicy(previous, next, body.syncSwipes !== false, body.syncBranches !== false);
     if (!hasCompleteMessageIds(body.snapshot)) return { status: 409, payload: { ok: false, error: { code: 'message_ids_required', message: 'All messages must have synchronization IDs. Refresh/reconcile the chat before retrying.' } } };
-    const metadataChanged = canonicalJson(state.chatMetadata || {}) !== canonicalJson(metadata);
+    const metadataChanged = body.syncMetadata !== false && canonicalJson(state.chatMetadata || {}) !== canonicalJson(metadata);
     if (!snapshotChanged && !metadataChanged) return { status: 200, event: null, unchanged: true };
     state.revision++;
     state.snapshot = next;
     state.chatMetadata = metadata;
-    state.hostSnapshotDigest = snapshotDigestForMode(next, body.syncSwipes === false ? 'relevant' : 'full');
+    state.hostSnapshotDigest = snapshotDigestForMode(next, 'full', true);
     state.hostMetadataDigest = metadataDigest(metadata);
+    state.hostMessageIdsPending = false;
     state.tombstones.push(...computeTombstones(previous, next, state.revision));
     const event = recordEvent(state, {
         type: body.type,
@@ -1458,8 +1654,10 @@ async function processMetadataMutation(req, scope, state, body) {
     const previous = clone(state.chatMetadata);
     if (stableJson(previous || {}) === stableJson(metadata)) return { status: 200, event: null, unchanged: true };
     state.revision++;
-    state.chatMetadata = metadata;
-    state.hostMetadataDigest = metadataDigest(metadata);
+    if (body.syncMetadata !== false) {
+        state.chatMetadata = metadata;
+        state.hostMetadataDigest = metadataDigest(metadata);
+    }
     const event = recordEvent(state, {
         type: 'metadata',
         opId: body.opId,
@@ -1470,10 +1668,16 @@ async function processMetadataMutation(req, scope, state, body) {
     return { status: 200, event };
 }
 
-async function processGroupSettings(scope, state, body) {
+async function processGroupSettings(req, scope, state, body) {
     if (scope.kind !== 'group') return { status: 400, payload: { ok: false, error: { code: 'not_group', message: 'group_settings requires a group scope.' } } };
     const revision = revisionCheck(state, body);
     if (!revision.ok) return { status: 409, payload: { ok: false, error: revision } };
+    if (body.hostGroupSettingsDigest !== undefined) {
+        const definition = await loadGroupDefinition(req, scope.groupId);
+        if (!definition?.ok) return { status: 409, payload: { ok: false, error: { code: 'stale_host_group_settings', message: 'The native group settings could not be verified.', currentDigest: null } } };
+        const currentDigest = groupSettingsDigest(groupSettingsSnapshot(definition.value));
+        if (currentDigest !== String(body.hostGroupSettingsDigest)) return { status: 409, payload: { ok: false, error: { code: 'stale_host_group_settings', message: 'The native group settings changed before this synchronization operation was applied.', currentDigest } } };
+    }
     if (!isObject(body.groupSettings) || !validateDataTree(body.groupSettings) || bytes(body.groupSettings) > LIMITS.maxGroupSettingsBytes) {
         return { status: 400, payload: { ok: false, error: { code: 'invalid_group_settings', message: 'groupSettings is invalid or too large.' } } };
     }
@@ -1483,6 +1687,7 @@ async function processGroupSettings(scope, state, body) {
     if (canonicalJson(sanitized) === canonicalJson(state.groupSettings || {})) return { status: 200, event: null, unchanged: true };
     state.revision++;
     state.groupSettings = sanitized;
+    state.hostGroupSettingsDigest = groupSettingsDigest(sanitized);
     const event = recordEvent(state, {
         type: 'group_settings',
         opId: body.opId,
@@ -1518,6 +1723,7 @@ async function processBranchAnnouncement(req, parentScope, parentState, body) {
     if (host.metadata?.integrity && String(host.metadata.integrity) !== String(childScope.branchId)) return { status: 400, payload: { ok: false, error: { code: 'branch_host_integrity_mismatch', message: 'The supplied branch ID does not match the native chat integrity.' } } };
 
     const childState = await loadState(req, childScope);
+    const childBeforeState = clone(childState);
     if (childState.revision === 0) {
         if (host.missingMessageIds) return { status: 409, payload: { ok: false, error: { code: 'branch_message_ids_missing', message: 'The native child chat does not yet contain synchronization message IDs.' } } };
         childState.snapshot = clone(host.snapshot);
@@ -1532,7 +1738,7 @@ async function processBranchAnnouncement(req, parentScope, parentState, body) {
             branchKind,
         });
         try { await persistState(req, childScope, childState); } catch (error) {
-            await restoreAfterPersistFailure(req, childScope, childState);
+            await restoreAfterPersistFailure(req, childScope, childState, childBeforeState);
             return { status: 507, payload: { ok: false, error: { code: 'persistence_failed', message: 'Branch state could not be durably persisted.' } } };
         }
         publish(childScope, 'sync', { epoch: childState.epoch, event: childEvent, state: serializePublicState(childState) }, childEvent.id);
@@ -1573,46 +1779,73 @@ async function processGenerationEvent(req, scope, state, body) {
         if (state.generation) {
             return { status: 409, payload: { ok: false, error: { code: 'generation_busy', message: 'Another synchronized client currently owns generation.', currentGeneration: clone(state.generation) } } };
         }
+        if (body.baseRevision !== undefined) {
+            const revision = revisionCheck(state, body);
+            if (!revision.ok) return { status: 409, payload: { ok: false, error: revision } };
+        }
         const generationId = body.generationId && validateGenerationId(body.generationId) ? String(body.generationId) : randomId('g_');
         const generationType = String(body.generationType || 'normal').slice(0, 64);
         if (!safeId(generationType, 64) || generationType === 'quiet') return { status: 400, payload: { ok: false, error: { code: 'invalid_generation_type', message: 'generationType is invalid for synchronized generation.' } } };
         if (generationType === 'group' && scope.kind !== 'group') return { status: 400, payload: { ok: false, error: { code: 'invalid_generation_type', message: 'Group generation requires a group scope.' } } };
         const requestedMessageId = body.messageId ? String(body.messageId) : null;
         if (requestedMessageId && !safeId(requestedMessageId, 128)) return { status: 400, payload: { ok: false, error: { code: 'invalid_message_id', message: 'messageId is invalid.' } } };
-        if (state.recoverableGeneration?.generation?.id === generationId) {
+        const recoverable = state.recoverableGeneration?.generation;
+        const reclaiming = !!recoverable && recoverable.id === generationId;
+        if (reclaiming) {
+            if (recoverable.ownerClientId !== body.clientId || recoverable.ownerDeviceId !== body.deviceId) {
+                return { status: 403, payload: { ok: false, error: { code: 'generation_recovery_owner_mismatch', message: 'Only the original generation owner can reclaim this expired generation.' } } };
+            }
+            state.recoverableGeneration = null;
+            state.pendingGenerationRecovery = null;
+        } else if (recoverable) {
+            // A new generation supersedes an expired/recoverable generation.
+            // Do not allow the old owner to apply a late terminal snapshot after
+            // this new generation has taken ownership of the scope.
             state.recoverableGeneration = null;
             state.pendingGenerationRecovery = null;
         }
 
-        state.generation = {
-            id: generationId,
-            ownerClientId: body.clientId,
-            ownerDeviceId: body.deviceId,
-            generationType,
-            phase: 'claimed',
-            startedAt: now(),
-            leaseUntil: now() + LIMITS.generationLeaseMs,
-            streamSeq: 0,
-            messageId: requestedMessageId,
-            streamMessage: null,
-            streamMessages: [],
-            stopRequested: false,
-            serverInstanceId,
-            lastPersistedStreamSeq: 0,
-            lastPersistedAt: now(),
-        };
+        state.generation = reclaiming
+            ? {
+                ...clone(recoverable),
+                ownerClientId: body.clientId,
+                ownerDeviceId: body.deviceId,
+                generationType,
+                phase: ['started', 'streaming'].includes(recoverable.phase) ? recoverable.phase : 'claimed',
+                leaseUntil: now() + LIMITS.generationLeaseMs,
+                messageId: requestedMessageId || recoverable.messageId || null,
+                serverInstanceId,
+                lastPersistedAt: now(),
+            }
+            : {
+                id: generationId,
+                ownerClientId: body.clientId,
+                ownerDeviceId: body.deviceId,
+                generationType,
+                phase: 'claimed',
+                startedAt: now(),
+                leaseUntil: now() + LIMITS.generationLeaseMs,
+                streamSeq: 0,
+                messageId: requestedMessageId,
+                streamMessage: null,
+                streamMessages: [],
+                stopRequested: false,
+                serverInstanceId,
+                lastPersistedStreamSeq: 0,
+                lastPersistedAt: now(),
+            };
         const event = recordEvent(state, { type: 'generation_claim', opId: body.opId, source: { clientId: body.clientId, deviceId: body.deviceId }, generation: clone(state.generation), ...(expiredGeneration ? { recoveredGeneration: expiredGeneration } : {}) });
         return { status: 200, event };
     }
 
     if (!state.generation) {
         if (body.type === 'generation_terminal' && state.recoverableGeneration?.generation?.id === String(body.generationId || '')) {
-            body.type = 'generation_terminal_recover';
-            return processGenerationEvent(req, scope, state, body);
+            body = { ...body, type: 'generation_terminal_recover' };
+        } else if (body.type !== 'generation_terminal_recover') {
+            return { status: 409, payload: { ok: false, error: { code: 'no_generation', message: 'There is no active synchronized generation.' } } };
         }
-        return { status: 409, payload: { ok: false, error: { code: 'no_generation', message: 'There is no active synchronized generation.' } } };
     }
-    if (String(body.generationId || '') !== state.generation.id) return { status: 409, payload: { ok: false, error: { code: 'generation_mismatch', message: 'The supplied generation ID does not match the active generation.' } } };
+    if (state.generation && String(body.generationId || '') !== state.generation.id) return { status: 409, payload: { ok: false, error: { code: 'generation_mismatch', message: 'The supplied generation ID does not match the active generation.' } } };
 
     if (body.type === 'generation_heartbeat') {
         if (!isGenerationOwner(state, body)) return { status: 403, payload: { ok: false, error: { code: 'not_generation_owner', message: 'Only the current generation owner can renew generation.' } } };
@@ -1627,7 +1860,7 @@ async function processGenerationEvent(req, scope, state, body) {
         if (!['claimed', 'started', 'streaming'].includes(state.generation.phase)) return { status: 409, payload: { ok: false, error: { code: 'generation_invalid_phase', message: 'Generation is not in a startable phase.' } } };
         const messageId = body.messageId === undefined || body.messageId === null || body.messageId === '' ? null : String(body.messageId);
         if (messageId && !safeId(messageId, 128)) return { status: 400, payload: { ok: false, error: { code: 'invalid_message_id', message: 'messageId is invalid.' } } };
-        state.generation.phase = 'started';
+        if (state.generation.phase === 'claimed') state.generation.phase = 'started';
         state.generation.leaseUntil = now() + LIMITS.generationLeaseMs;
         if (messageId) state.generation.messageId = messageId;
         const event = recordEvent(state, { type: 'generation_started', opId: body.opId, source: { clientId: body.clientId, deviceId: body.deviceId }, generation: clone(state.generation) });
@@ -1639,34 +1872,46 @@ async function processGenerationEvent(req, scope, state, body) {
         if (!['claimed', 'started', 'streaming'].includes(state.generation.phase)) return { status: 409, payload: { ok: false, error: { code: 'generation_invalid_phase', message: 'Generation input cannot be published in the current phase.' } } };
         const revision = revisionCheck(state, body);
         if (!revision.ok) return { status: 409, payload: { ok: false, error: revision } };
-        const validation = validateSnapshot(body.snapshot);
-        if (!validation.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_generation_input', message: validation.error } } };
-        if (!hasCompleteMessageIds(body.snapshot)) return { status: 409, payload: { ok: false, error: { code: 'message_ids_required', message: 'All generation input messages must have synchronization IDs.' } } };
-        const metadata = body.chatMetadata === undefined ? clone(state.chatMetadata) : clone(body.chatMetadata);
+        if (body.snapshot !== undefined) {
+            const validation = validateSnapshot(body.snapshot);
+            if (!validation.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_generation_input', message: validation.error } } };
+            if (!hasCompleteMessageIds(body.snapshot)) return { status: 409, payload: { ok: false, error: { code: 'message_ids_required', message: 'All generation input messages must have synchronization IDs.' } } };
+        }
+        const metadata = body.syncMetadata === false
+            ? clone(state.chatMetadata)
+            : (body.chatMetadata === undefined ? clone(state.chatMetadata) : clone(body.chatMetadata));
         const metadataCheck = validateMetadata(metadata);
         if (!metadataCheck.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_metadata', message: metadataCheck.error } } };
         const host = await readHostChat(req, scope);
+        if (body.hostSnapshotDigest !== undefined && host.missingMessageIds) return { status: 409, payload: { ok: false, error: { code: 'host_message_ids_missing', message: 'Persist synchronization message IDs in the native chat before publishing generation input.' } } };
         const hostCheck = hostDigestCheck(host, body);
         if (!hostCheck.ok) return { status: 409, payload: { ok: false, error: hostCheck } };
         const previous = clone(state.snapshot);
-        const next = applySyncPolicy(body.snapshot, state.snapshot, body.syncSwipes !== false);
-        const snapshotChanged = !snapshotEquivalentForPolicy(previous, next, body.syncSwipes !== false);
-        const metadataChanged = canonicalJson(state.chatMetadata || {}) !== canonicalJson(metadata);
+        const hasSnapshot = Array.isArray(body.snapshot);
+        const next = hasSnapshot && body.syncMessages !== false ? applySyncPolicy(body.snapshot, state.snapshot, body.syncSwipes !== false, body.syncBranches !== false) : previous;
+        const snapshotChanged = hasSnapshot && body.syncMessages !== false && !snapshotEquivalentForPolicy(previous, next, body.syncSwipes !== false, body.syncBranches !== false);
+        const metadataChanged = body.chatMetadata !== undefined && canonicalJson(state.chatMetadata || {}) !== canonicalJson(metadata);
         if (snapshotChanged || metadataChanged) {
             state.revision++;
-            state.snapshot = next;
-            state.chatMetadata = metadata;
-            state.hostSnapshotDigest = snapshotDigestForMode(next, body.syncSwipes === false ? 'relevant' : 'full');
-            state.tombstones.push(...computeTombstones(previous, next, state.revision));
+            if (hasSnapshot) {
+                state.snapshot = next;
+                state.hostSnapshotDigest = snapshotDigestForMode(next, 'full', true);
+                state.hostMessageIdsPending = false;
+                state.tombstones.push(...computeTombstones(previous, next, state.revision));
+            }
+            if (body.chatMetadata !== undefined) {
+                state.chatMetadata = metadata;
+                state.hostMetadataDigest = metadataDigest(metadata);
+            }
         }
-        state.generation.phase = 'started';
+        if (state.generation.phase !== 'streaming') state.generation.phase = 'started';
         state.generation.leaseUntil = now() + LIMITS.generationLeaseMs;
         const event = recordEvent(state, {
             type: 'generation_input',
             opId: body.opId,
             source: { clientId: body.clientId, deviceId: body.deviceId },
             generationId: state.generation.id,
-            snapshot: clone(state.snapshot),
+            snapshot: hasSnapshot ? clone(state.snapshot) : null,
             chatMetadata: clone(state.chatMetadata),
             generation: clone(state.generation),
             stateDigest: sha256(canonicalJson(state.snapshot)),
@@ -1684,7 +1929,7 @@ async function processGenerationEvent(req, scope, state, body) {
         if (!validation.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_stream_message', message: validation.error } } };
         if (!hasCompleteMessageIds([body.message])) return { status: 400, payload: { ok: false, error: { code: 'message_ids_required', message: 'Streamed messages must have synchronization IDs.' } } };
         if (bytes(body.message) > LIMITS.maxLiveGenerationBytes) return { status: 413, payload: { ok: false, error: { code: 'generation_stream_message_too_large', message: 'The streamed generation message is too large.' } } };
-        const message = applySyncPolicy([body.message], state.generation.streamMessages.map(entry => entry.message), body.syncSwipes !== false)[0];
+        const message = applySyncPolicy([body.message], state.generation.streamMessages.map(entry => entry.message), body.syncSwipes !== false, body.syncBranches !== false)[0];
         const messageId = getMessageId(message);
         if (!messageId) return { status: 400, payload: { ok: false, error: { code: 'invalid_stream_message_id', message: 'Stream message has no valid synchronization ID.' } } };
         if (body.messageId !== undefined && String(body.messageId) !== String(messageId)) {
@@ -1730,27 +1975,40 @@ async function processGenerationEvent(req, scope, state, body) {
         if (recoverable.ownerClientId !== body.clientId || recoverable.ownerDeviceId !== body.deviceId) return { status: 403, payload: { ok: false, error: { code: 'not_generation_owner', message: 'Only the original generation owner can recover the generation.' } } };
         const baseRevision = Number(body.baseRevision);
         if (!Number.isInteger(baseRevision) || baseRevision !== state.revision) return { status: 409, payload: { ok: false, error: { code: 'revision_conflict', message: 'The chat changed while the generation was disconnected.', currentRevision: state.revision } } };
-        const validation = validateSnapshot(body.snapshot);
-        if (!validation.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_snapshot', message: validation.error } } };
-        if (!hasCompleteMessageIds(body.snapshot)) return { status: 409, payload: { ok: false, error: { code: 'message_ids_required', message: 'All messages must have synchronization IDs.' } } };
-        const metadata = body.chatMetadata === undefined ? clone(state.chatMetadata) : clone(body.chatMetadata);
+        if (body.snapshot !== undefined) {
+            const validation = validateSnapshot(body.snapshot);
+            if (!validation.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_snapshot', message: validation.error } } };
+            if (!hasCompleteMessageIds(body.snapshot)) return { status: 409, payload: { ok: false, error: { code: 'message_ids_required', message: 'All messages must have synchronization IDs.' } } };
+        }
+        const metadata = body.syncMetadata === false
+            ? clone(state.chatMetadata)
+            : (body.chatMetadata === undefined ? clone(state.chatMetadata) : clone(body.chatMetadata));
         const metadataCheck = validateMetadata(metadata);
         if (!metadataCheck.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_metadata', message: metadataCheck.error } } };
         const host = await readHostChat(req, scope);
+        if (body.hostSnapshotDigest !== undefined && host.missingMessageIds) return { status: 409, payload: { ok: false, error: { code: 'host_message_ids_missing', message: 'Persist synchronization message IDs in the native chat before finalizing generation.' } } };
         const hostCheck = hostDigestCheck(host, body);
         if (!hostCheck.ok) return { status: 409, payload: { ok: false, error: hostCheck } };
         const previous = clone(state.snapshot);
-        const next = applySyncPolicy(body.snapshot, state.snapshot, body.syncSwipes !== false);
-        if (!snapshotEquivalentForPolicy(previous, next, body.syncSwipes !== false) || canonicalJson(state.chatMetadata || {}) !== canonicalJson(metadata)) {
+        const hasSnapshot = Array.isArray(body.snapshot);
+        const next = hasSnapshot && body.syncMessages !== false ? applySyncPolicy(body.snapshot, state.snapshot, body.syncSwipes !== false, body.syncBranches !== false) : previous;
+        const snapshotChanged = hasSnapshot && body.syncMessages !== false && !snapshotEquivalentForPolicy(previous, next, body.syncSwipes !== false, body.syncBranches !== false);
+        const metadataChanged = body.chatMetadata !== undefined && canonicalJson(state.chatMetadata || {}) !== canonicalJson(metadata);
+        if (snapshotChanged || metadataChanged) {
             state.revision++;
-            state.snapshot = next;
-            state.chatMetadata = metadata;
-            state.hostSnapshotDigest = snapshotDigestForMode(next, body.syncSwipes === false ? 'relevant' : 'full');
-            state.hostMetadataDigest = metadataDigest(metadata);
-            state.tombstones.push(...computeTombstones(previous, next, state.revision));
+            if (hasSnapshot) {
+                state.snapshot = next;
+                state.hostSnapshotDigest = snapshotDigestForMode(next, 'full', true);
+                state.hostMessageIdsPending = false;
+                state.tombstones.push(...computeTombstones(previous, next, state.revision));
+            }
+            if (body.chatMetadata !== undefined) {
+                state.chatMetadata = metadata;
+                state.hostMetadataDigest = metadataDigest(metadata);
+            }
         }
-        const finalGeneration = { ...clone(recoverable), phase: ['completed', 'stopped', 'failed'].includes(body.status) ? body.status : 'failed', leaseUntil: now() };
-        const event = recordEvent(state, { type: 'generation_terminal_recover', opId: body.opId, source: { clientId: body.clientId, deviceId: body.deviceId }, generationId: finalGeneration.id, generation: finalGeneration, status: finalGeneration.phase, snapshot: clone(state.snapshot), chatMetadata: clone(state.chatMetadata), recovered: true });
+        const finalGeneration = { ...clone(recoverable), phase: ['completed', 'stopped', 'failed'].includes(body.status) ? body.status : 'failed', leaseUntil: now(), serverInstanceId };
+        const event = recordEvent(state, { type: 'generation_terminal_recover', opId: body.opId, source: { clientId: body.clientId, deviceId: body.deviceId }, generationId: finalGeneration.id, generation: finalGeneration, status: finalGeneration.phase, snapshot: hasSnapshot ? clone(state.snapshot) : null, chatMetadata: clone(state.chatMetadata), recovered: true });
         state.recoverableGeneration = null;
         state.pendingGenerationRecovery = null;
         return { status: 200, event };
@@ -1759,30 +2017,40 @@ async function processGenerationEvent(req, scope, state, body) {
     if (body.type === 'generation_terminal') {
         if (!isGenerationOwner(state, body)) return { status: 403, payload: { ok: false, error: { code: 'not_generation_owner', message: 'Only the generation owner can finalize generation.' } } };
         const status = ['completed', 'stopped', 'failed'].includes(body.status) ? body.status : 'failed';
-        if (body.snapshot === undefined) return { status: 400, payload: { ok: false, error: { code: 'final_snapshot_required', message: 'A final chat snapshot is required when generation terminates.' } } };
-        const validation = validateSnapshot(body.snapshot);
-        if (!validation.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_snapshot', message: validation.error } } };
-        const metadata = body.chatMetadata === undefined ? clone(state.chatMetadata) : clone(body.chatMetadata);
+        if (body.snapshot !== undefined) {
+            const validation = validateSnapshot(body.snapshot);
+            if (!validation.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_snapshot', message: validation.error } } };
+        }
+        const metadata = body.syncMetadata === false
+            ? clone(state.chatMetadata)
+            : (body.chatMetadata === undefined ? clone(state.chatMetadata) : clone(body.chatMetadata));
         const metadataCheck = validateMetadata(metadata);
         if (!metadataCheck.ok) return { status: 400, payload: { ok: false, error: { code: 'invalid_metadata', message: metadataCheck.error } } };
         if (scope.branchId && metadata.integrity && String(metadata.integrity) !== String(scope.branchId)) return { status: 400, payload: { ok: false, error: { code: 'branch_integrity_mismatch', message: 'Branch integrity does not match this synchronized branch.' } } };
         if (scope.parentChatId && metadata.main_chat && String(metadata.main_chat) !== String(scope.parentChatId)) return { status: 400, payload: { ok: false, error: { code: 'branch_parent_mismatch', message: 'Branch parent does not match this synchronized scope.' } } };
 
         const host = await readHostChat(req, scope);
+        if (body.hostSnapshotDigest !== undefined && host.missingMessageIds) return { status: 409, payload: { ok: false, error: { code: 'host_message_ids_missing', message: 'Persist synchronization message IDs in the native chat before finalizing generation.' } } };
         const hostCheck = hostDigestCheck(host, body);
         if (!hostCheck.ok) return { status: 409, payload: { ok: false, error: hostCheck } };
 
         const previous = clone(state.snapshot);
-        const next = applySyncPolicy(body.snapshot, state.snapshot, body.syncSwipes !== false);
-        const snapshotChanged = !snapshotEquivalentForPolicy(previous, next, body.syncSwipes !== false);
-        const metadataChanged = canonicalJson(state.chatMetadata || {}) !== canonicalJson(metadata);
+        const hasSnapshot = Array.isArray(body.snapshot);
+        const next = hasSnapshot && body.syncMessages !== false ? applySyncPolicy(body.snapshot, state.snapshot, body.syncSwipes !== false, body.syncBranches !== false) : previous;
+        const snapshotChanged = hasSnapshot && body.syncMessages !== false && !snapshotEquivalentForPolicy(previous, next, body.syncSwipes !== false, body.syncBranches !== false);
+        const metadataChanged = body.chatMetadata !== undefined && canonicalJson(state.chatMetadata || {}) !== canonicalJson(metadata);
         if (snapshotChanged || metadataChanged) {
             state.revision++;
-            state.snapshot = next;
-            state.chatMetadata = metadata;
-            state.hostSnapshotDigest = snapshotDigestForMode(next, body.syncSwipes === false ? 'relevant' : 'full');
-            state.hostMetadataDigest = metadataDigest(metadata);
-            state.tombstones.push(...computeTombstones(previous, next, state.revision));
+            if (hasSnapshot) {
+                state.snapshot = next;
+                state.hostSnapshotDigest = snapshotDigestForMode(next, 'full', true);
+                state.hostMessageIdsPending = false;
+                state.tombstones.push(...computeTombstones(previous, next, state.revision));
+            }
+            if (body.chatMetadata !== undefined) {
+                state.chatMetadata = metadata;
+                state.hostMetadataDigest = metadataDigest(metadata);
+            }
         }
 
         const finalGeneration = clone(state.generation);
@@ -1796,7 +2064,7 @@ async function processGenerationEvent(req, scope, state, body) {
             generationId: finalGeneration.id,
             generation: finalGeneration,
             status,
-            snapshot: clone(state.snapshot),
+            snapshot: hasSnapshot ? clone(state.snapshot) : null,
             chatMetadata: clone(state.chatMetadata),
         });
         state.generation = null;
@@ -1828,6 +2096,7 @@ async function processChatRenamed(req, scope, state, body) {
     if (!validation.ok) return { status: 409, payload: { ok: false, error: { code: 'rename_target_invalid', message: 'The renamed chat could not be resolved on the server.', detail: validation.code } } };
     const targetHost = await readHostChat(req, targetScope);
     if (!targetHost.ok || !targetHost.exists) return { status: 409, payload: { ok: false, error: { code: 'rename_target_missing', message: 'The renamed chat file is not available on the server yet.' } } };
+
     state.revision++;
     state.renamedTo = { chatId: newChatId, scope: targetScope, renamedAt: now() };
     const event = recordEvent(state, {
@@ -1838,10 +2107,40 @@ async function processChatRenamed(req, scope, state, body) {
         newChatId,
         newScope: targetScope,
     });
+
+    // Carry the synchronization history into the native renamed chat so clients
+    // joining the new filename do not start from revision 1 again. Refuse to
+    // overwrite an already-established target synchronization state.
+    const transfer = await withScopeLock(targetScope, async () => {
+        const targetState = await loadState(req, targetScope);
+        const occupied = Number(targetState.revision || 0) > 0
+            || targetState.snapshot.length > 0
+            || !!targetState.generation
+            || !!targetState.deleted;
+        if (occupied) return { ok: false, code: 'rename_target_sync_exists' };
+
+        const carried = clone(state);
+        carried.scope = clone(targetScope);
+        carried.renamedTo = null;
+        carried.deleted = false;
+        carried.serverInstanceId = serverInstanceId;
+        carried.updatedAt = now();
+        Object.keys(targetState).forEach(key => delete targetState[key]);
+        Object.assign(targetState, carried);
+        scopes.set(scopeKey(targetScope), targetState);
+        await persistState(req, targetScope, targetState);
+        return { ok: true };
+    });
+    if (!transfer.ok) {
+        // Keep the old state valid, but tell the initiating client not to assume
+        // automatic state transfer occurred when a target sync namespace existed.
+        event.renameStateTransfer = transfer.code;
+    }
     return { status: 200, event };
 }
 
 async function processChatDeleted(scope, state, body, type = 'chat_deleted') {
+    if (state.deleted) return { status: 200, event: null, unchanged: true };
     const revision = revisionCheck(state, body);
     if (!revision.ok) return { status: 409, payload: { ok: false, error: revision } };
     state.revision++;
@@ -1874,8 +2173,28 @@ async function handleEvent(req, res) {
 
     return withScopeLock(scope, async () => {
         const state = await loadState(req, scope);
+        const beforeState = clone(state);
         const cached = findCachedOperation(state, opId);
         if (cached) return res.json(cachedResultResponse(state, cached));
+
+        const expired = expireGeneration(state);
+        if (expired) {
+            const recoveryEvent = recordEvent(state, {
+                type: 'generation_recover',
+                source: { clientId: 'server', deviceId: 'server' },
+                previousGeneration: clone(expired),
+                automatic: true,
+                reason: 'expired_on_event',
+            });
+            state.pendingGenerationRecovery = null;
+            try {
+                await persistState(req, scope, state);
+                publish(scope, 'sync', { epoch: state.epoch, event: clone(recoveryEvent), state: serializePublicState(state) }, recoveryEvent.id);
+            } catch (error) {
+                await restoreAfterPersistFailure(req, scope, state, beforeState);
+                return sendError(res, 507, 'persistence_failed', 'Expired generation recovery could not be durably persisted.');
+            }
+        }
 
         if (state.generation && ['snapshot', 'metadata', 'reconcile_local', 'group_settings', 'branch_announce', 'chat_renamed', 'chat_deleted', 'group_chat_deleted'].includes(body.type)) {
             return res.status(409).json({
@@ -1895,7 +2214,7 @@ async function handleEvent(req, res) {
             else if (body.type === 'chat_deleted') result = await processChatDeleted(scope, state, body, 'chat_deleted');
             else if (body.type === 'group_chat_deleted') result = await processChatDeleted(scope, state, body, 'group_chat_deleted');
             else if (body.type === 'metadata') result = await processMetadataMutation(req, scope, state, body);
-            else if (body.type === 'group_settings') result = await processGroupSettings(scope, state, body);
+            else if (body.type === 'group_settings') result = await processGroupSettings(req, scope, state, body);
             else if (body.type === 'branch_announce') result = await processBranchAnnouncement(req, scope, state, body);
             else result = await processSnapshotMutation(req, scope, state, body);
         } catch (error) {
@@ -1905,14 +2224,16 @@ async function handleEvent(req, res) {
         if (result.payload) return res.status(result.status).json(result.payload);
 
         state.updatedAt = now();
+        state.recoveredFromInvalidState = false;
         rememberOperation(state, opId, { ok: true, eventId: result.event?.id || 0, revision: state.revision, epoch: state.epoch, generation: state.generation }, body.type);
         if (shouldPersistEvent(state, body.type)) {
             try { await persistState(req, scope, state); } catch (error) {
-                await restoreAfterPersistFailure(req, scope, state);
+                await restoreAfterPersistFailure(req, scope, state, beforeState);
                 return sendError(res, 507, 'persistence_failed', 'Synchronization state could not be durably persisted.');
             }
         }
 
+        updateMemberRevision(scope, clientId, deviceId, state.revision);
         const publicState = serializePublicState(state);
         if (result.event) {
             const liveOnly = ['generation_claim','generation_started','generation_heartbeat','generation_stream','generation_stop_request'].includes(String(result.event.type || ''));
@@ -1940,12 +2261,15 @@ async function handleEvent(req, res) {
 async function handleHealth(req, res) {
     const userId = userIdFromRequest(req);
     if (!userId) return sendError(res, 401, 'unauthenticated', 'SillyTavern authentication is required.');
-    return res.json({ ok: true, plugin: info.id, version: '1.7.0', protocol: PROTOCOL, schema: SCHEMA, userId, node: process.version, storage: true, scopes: scopes.size, sse: totalSseConnections, serverInstanceId, shuttingDown });
+    return res.json({ ok: true, plugin: info.id, version: '1.9.0', protocol: PROTOCOL, schema: SCHEMA, userId, node: process.version, storage: true, scopes: scopes.size, sse: totalSseConnections, serverInstanceId, shuttingDown });
 }
 
 async function init(router) {
     shuttingDown = false;
     cleanupTimer = setInterval(async () => {
+        if (cleanupRunning) return;
+        cleanupRunning = true;
+        try {
         for (const [key, map] of members) {
             const cutoff = now() - LIMITS.memberTtlMs;
             for (const [clientId, member] of map) if (member.lastSeen < cutoff) map.delete(clientId);
@@ -1953,17 +2277,29 @@ async function init(router) {
         }
         const cutoff = now();
         for (const [key, window] of rateWindows) if (window.expiresAt <= cutoff) rateWindows.delete(key);
-        for (const [key, state] of scopes) {
-            const recovered = recoverExpiredGenerationEvent(state, { clientId: 'server', deviceId: 'server' }, 'expired_on_cleanup');
-            if (!recovered) continue;
-            const file = stateFiles.get(key);
-            if (file) {
-                try { await atomicWrite(file, state); } catch {}
-            }
-            publish(state.scope, 'sync', { epoch: state.epoch, event: clone(recovered), state: serializePublicState(state) }, recovered.id);
+        for (const [key, window] of userRateWindows) if (window.expiresAt <= cutoff) userRateWindows.delete(key);
+        for (const [key, cachedState] of scopes) {
+            if (!cachedState?.scope) continue;
+            await withScopeLock(cachedState.scope, async () => {
+                const state = scopes.get(key) || cachedState;
+                const recovered = recoverExpiredGenerationEvent(state, { clientId: 'server', deviceId: 'server' }, 'expired_on_cleanup');
+                if (!recovered) return;
+                const file = stateFiles.get(key);
+                if (file) {
+                    // Cleanup runs outside an authenticated request context, so the
+                    // request-bound persistence helper cannot safely be called here.
+                    // The state is already held under the per-scope lock; use the
+                    // same atomic writer used by normal persistence.
+                    try { await atomicWrite(file, state); } catch {}
+                }
+                publish(state.scope, 'sync', { epoch: state.epoch, event: clone(recovered), state: serializePublicState(state) }, recovered.id);
+            }).catch(() => {});
         }
         await Promise.resolve();
-    }, 10 * 60_000);
+        } finally {
+            cleanupRunning = false;
+        }
+    }, 5_000);
     cleanupTimer.unref?.();
 
     router.get('/health', handleHealth);
@@ -1996,7 +2332,7 @@ async function exit() {
             state.pendingGenerationRecovery = { reason: 'server_shutdown', previousGeneration: clone(state.generation) };
             state.generation = null;
             const recovery = consumePendingGenerationRecovery(state, { clientId: 'server', deviceId: 'server' });
-            if (recovery) state.events.push(recovery);
+            if (recovery) { /* recovery is already recorded by consumePendingGenerationRecovery */ }
         }
         state.serverInstanceId = serverInstanceId;
         state.updatedAt = now();
