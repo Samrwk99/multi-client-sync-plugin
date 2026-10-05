@@ -1164,10 +1164,14 @@ async function handleJoin(req, res) {
     let resultState;
     let bootstrapped = false;
     let host;
-    let subscriptionToken;
+    const subscriptionToken = randomId('sse_');
 
     try {
         await withScopeLock(scope, async () => {
+            // Re-assert membership under the same scope lock used by /leave. This
+            // closes the race where an older async leave can otherwise land after
+            // the initial touchMember() but before the new join finishes.
+            ids = touchMember(scope, req.body || {});
             const state = await loadState(req, scope);
             const pendingRecoveryEvent = consumePendingGenerationRecovery(state, { clientId: 'server', deviceId: 'server' });
             const beforeGeneration = !!state.generation;
@@ -1208,17 +1212,15 @@ async function handleJoin(req, res) {
                 if (bootstrapEvent?.type === 'bootstrap') publish(scope, 'sync', { epoch: state.epoch, event: clone(bootstrapEvent), state: serializePublicState(state) }, bootstrapEvent.id);
             }
             resultState = clone(state);
-            subscriptionToken = randomId('sse_');
+            for (const [oldToken, subscription] of subscriptions) {
+                if (subscription.userId === userId && subscription.clientId === ids.clientId && subscription.deviceId === ids.deviceId) closeSubscription(oldToken);
+            }
+            subscriptions.set(subscriptionToken, { token: subscriptionToken, userId, clientId: ids.clientId, deviceId: ids.deviceId, scope: clone(scope), scopeKey: scopeKey(scope), createdAt: now(), res: null });
         });
     } catch (error) {
         if (error.code === 'scope_limit') return sendError(res, 429, error.code, error.message);
         return sendError(res, 507, 'persistence_failed', 'Synchronization state could not be initialized.');
     }
-
-    for (const [oldToken, subscription] of subscriptions) {
-        if (subscription.userId === userId && subscription.clientId === ids.clientId && subscription.deviceId === ids.deviceId) closeSubscription(oldToken);
-    }
-    subscriptions.set(subscriptionToken, { token: subscriptionToken, userId, clientId: ids.clientId, deviceId: ids.deviceId, scope: clone(scope), scopeKey: scopeKey(scope), createdAt: now(), res: null });
 
     await cleanupUserState(req);
     return res.json({
@@ -1247,11 +1249,20 @@ async function handleLeave(req, res) {
     try { scope = normalizeScope(req, req.body?.scope); } catch (error) { return sendError(res, 400, 'invalid_scope', error.message); }
     if (Number(req.body?.protocol) !== PROTOCOL || Number(req.body?.schema) !== SCHEMA) return sendError(res, 409, 'protocol_mismatch', 'Synchronization protocol/schema mismatch.');
     const clientId = String(req.body?.clientId || ''), deviceId = String(req.body?.deviceId || '');
+    const subscriptionToken = String(req.body?.subscriptionToken || '');
     if (!safeId(clientId, 128) || !safeId(deviceId, 128)) return sendError(res, 400, 'invalid_client', 'clientId and deviceId are required.');
+    if (!safeId(subscriptionToken, 160)) return sendError(res, 400, 'invalid_subscription', 'subscriptionToken is required for a synchronized leave.');
     return withScopeLock(scope, async () => {
+        const subscription = subscriptions.get(subscriptionToken);
+        const validSubscription = subscription
+            && subscription.scopeKey === scopeKey(scope)
+            && subscription.clientId === clientId
+            && subscription.deviceId === deviceId;
+        if (!validSubscription) return res.json({ ok: true, clientId, deviceId, ignored: true });
+
+        closeSubscription(subscriptionToken);
         const member = members.get(scopeKey(scope))?.get(clientId);
         if (member && member.deviceId === deviceId) members.get(scopeKey(scope))?.delete(clientId);
-        for (const [token, subscription] of subscriptions) if (subscription.scopeKey === scopeKey(scope) && subscription.clientId === clientId && subscription.deviceId === deviceId) closeSubscription(token);
         return res.json({ ok: true, clientId, deviceId });
     });
 }
