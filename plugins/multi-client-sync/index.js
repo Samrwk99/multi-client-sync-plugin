@@ -1,2832 +1,3608 @@
-/**
- * SillyTavern Multi-Client Chat Synchronization
- * Server Plugin
- *
- * Authoritative server-side synchronization layer for the companion UI extension.
- *
- * Provides:
- *   POST /join
- *   POST /event
- *   POST /heartbeat
- *   POST /leave
- *   GET  /events
- *   GET  /state
- *   GET  /health
- *
- * Important:
- * - State is intentionally scoped by authenticated SillyTavern user + chatKey.
- * - The authenticated server user is authoritative; client-supplied userId is
- *   never used for authorization.
- * - Server sequence numbers are authoritative.
- * - Event history is kept in memory and bounded.
- * - Generation ownership is lease/heartbeat based.
- * - A dead generation owner causes deterministic generation termination rather
- *   than attempting to continue a browser-owned generation on the server.
- *
- * This plugin does NOT replace SillyTavern's chat persistence system.
- * It coordinates clients around the normal SillyTavern chat state.
- */
-
-const crypto = require('node:crypto');
-const express = require('express');
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const PLUGIN_ID = 'multi-client-sync';
-const LOG_PREFIX = '[MCS Server]';
-
-const MAX_EVENTS_PER_GROUP = 10000;
-const MAX_JOIN_REPLAY_EVENTS = 2000;
-const MAX_GROUPS = 1000;
-
-const CLIENT_TTL_MS = 35000;
-const EMPTY_GROUP_RETENTION_MS = 10 * 60 * 1000;
-
-const CLEANUP_INTERVAL_MS = 5000;
-const SSE_KEEPALIVE_INTERVAL_MS = 15000;
-
-const MAX_ID_LENGTH = 256;
-const MAX_CHAT_KEY_LENGTH = 1024;
-const MAX_EVENT_ID_LENGTH = 512;
-const MAX_EVENT_BYTES = 1024 * 1024;
-
-const ALLOWED_EVENT_TYPES = new Set([
-    'MESSAGE_SENT',
-    'MESSAGE_RECEIVED',
-    'MESSAGE_EDITED',
-    'MESSAGE_DELETED',
-    'MESSAGE_SWIPED',
-
-    'CHAT_CHANGED',
-    'CHAT_RELOADED',
-
-    'GENERATION_STARTED',
-    'GENERATION_STREAM',
-    'GENERATION_STOP_REQUESTED',
-    'GENERATION_STOPPED',
-    'GENERATION_COMPLETED',
-    'GENERATION_FAILED',
-    'GENERATION_OWNER_RELEASED',
-]);
-
-// ---------------------------------------------------------------------------
-// Server state
-// ---------------------------------------------------------------------------
+'use strict';
 
 /**
- * Map:
- *   authenticatedUser + chatKey
- *      -> synchronization group
+ * Multi Client Sync - SillyTavern server plugin.
  *
- * @type {Map<string, GroupState>}
+ * Responsibilities:
+ * - Authenticated per-user/per-chat scoping
+ * - Membership/heartbeat leases
+ * - Authoritative revisions
+ * - Monotonic event sequence numbers
+ * - Idempotent operation IDs
+ * - SSE live delivery
+ * - SSE replay / resync signalling
+ * - Server epoch fencing across restarts
+ * - Generation ownership / leases / stop requests
+ * - Atomic-ish JSON persistence of sync state
+ * - Bounded retained event history
+ *
+ * The plugin does not write ST chat files directly.
+ * The client applies authoritative snapshots through ST's own save path.
  */
-const groups = new Map();
 
-let cleanupTimer = null;
-let keepaliveTimer = null;
+const fs = require('fs/promises');
+const path = require('path');
+const crypto = require('crypto');
 
-const serverInstanceId = crypto.randomUUID();
 
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* Configuration                                                               */
+/* -------------------------------------------------------------------------- */
 
-function log(...args) {
-    console.log(LOG_PREFIX, ...args);
-}
+const PLUGIN_ID =
+    'multi-client-sync';
 
-function warn(...args) {
-    console.warn(LOG_PREFIX, ...args);
-}
+const PROTOCOL_VERSION =
+    2;
 
-function error(...args) {
-    console.error(LOG_PREFIX, ...args);
-}
+const STATE_SCHEMA_VERSION =
+    2;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+const MAX_EVENT_BYTES =
+    8 * 1024 * 1024;
 
-function randomId() {
-    return crypto.randomUUID();
-}
+const MAX_EVENTS =
+    2000;
 
-function cleanString(value, maxLength = MAX_ID_LENGTH) {
-    if (value === undefined || value === null) {
-        return '';
-    }
+const MAX_SEEN_OPS =
+    5000;
 
-    const result = String(value);
+const MAX_MEMBERS_PER_SCOPE =
+    32;
 
-    if (result.length > maxLength) {
-        return result.slice(0, maxLength);
-    }
+const MEMBER_TTL_MS =
+    45_000;
 
-    return result;
-}
+const GENERATION_LEASE_MS =
+    20_000;
 
-function isPlainObject(value) {
-    return (
-        value !== null &&
-        typeof value === 'object' &&
-        !Array.isArray(value)
+const GENERATION_SCAN_MS =
+    5_000;
+
+const PERSIST_DEBOUNCE_MS =
+    750;
+
+const KEEPALIVE_MS =
+    15_000;
+
+
+/* -------------------------------------------------------------------------- */
+/* Runtime state                                                               */
+/* -------------------------------------------------------------------------- */
+
+const runtimeEpoch =
+    crypto.randomUUID();
+
+const scopes =
+    new Map();
+
+const sseByScope =
+    new Map();
+
+const persistTimers =
+    new Map();
+
+const persistDir =
+    path.join(
+        __dirname,
+        '.data',
+        'scopes',
     );
+
+let scanTimer =
+    null;
+
+const info = {
+    id:
+        PLUGIN_ID,
+
+    name:
+        'Multi Client Sync',
+
+    description:
+        'Authoritative multi-client SillyTavern chat synchronization with SSE, replay, revisions, and generation leases.',
+};
+
+
+/* -------------------------------------------------------------------------- */
+/* Utilities                                                                   */
+/* -------------------------------------------------------------------------- */
+
+function now() {
+    return Date.now();
 }
 
-function byteLength(value) {
-    try {
-        return Buffer.byteLength(
-            JSON.stringify(value),
-            'utf8',
-        );
-    } catch {
-        return Infinity;
-    }
-}
-
-function safeClone(value) {
+function clone(value) {
     if (value === undefined) {
         return undefined;
     }
 
-    try {
-        return JSON.parse(
-            JSON.stringify(value),
-        );
-    } catch {
-        return value;
-    }
+    return structuredClone(value);
 }
 
-function buildChatKey(body) {
-    const characterId =
-        cleanString(
-            body.characterId,
-            MAX_ID_LENGTH,
-        );
-
-    const groupId =
-        cleanString(
-            body.groupId,
-            MAX_ID_LENGTH,
-        );
-
-    const chatId =
-        cleanString(
-            body.chatId,
-            MAX_ID_LENGTH,
-        );
-
-    if (!chatId) {
-        return null;
-    }
-
-    const scope =
-        groupId
-            ? `g:${groupId}`
-            : `c:${characterId}`;
-
-    return `${scope}::${chatId}`;
+function jsonBytes(value) {
+    return Buffer.byteLength(
+        JSON.stringify(value),
+        'utf8',
+    );
 }
 
-function scopeKey(
-    userHandle,
-    chatKey,
-) {
-    return `${userHandle}::${chatKey}`;
-}
-
-// ---------------------------------------------------------------------------
-// Authentication
-// ---------------------------------------------------------------------------
-
-/**
- * SillyTavern exposes authenticated user information through req.user.
- *
- * We deliberately do NOT trust body.userId as the authorization identity.
- *
- * @param {import('express').Request} req
- * @returns {{handle:string}}
- */
-function getAuthenticatedUser(req) {
-    const handle =
-        req?.user?.profile?.handle;
-
-    if (!handle) {
-        throw new Error(
-            'Authenticated SillyTavern user is unavailable',
-        );
-    }
-
-    return {
-        handle: String(handle),
-    };
-}
-
-function requireAuthenticatedUser(
-    req,
-    res,
-) {
-    try {
-        return getAuthenticatedUser(req);
-    } catch (e) {
-        res.status(401).json({
-            success: false,
-            error:
-                'Authentication required',
-        });
-
-        return null;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
-
-function validateClientId(
-    clientId,
-) {
-    const value =
-        cleanString(
-            clientId,
-            MAX_ID_LENGTH,
-        );
-
+function stableStringify(value) {
     if (
-        !value ||
-        value.length > MAX_ID_LENGTH
+        value === null ||
+        typeof value !== 'object'
     ) {
-        return null;
+        return JSON.stringify(value);
+    }
+
+    if (Array.isArray(value)) {
+        return `[${value.map(stableStringify).join(',')}]`;
+    }
+
+    return `{${Object.keys(value).sort().map(
+        key =>
+            `${JSON.stringify(key)}:${stableStringify(value[key])}`,
+    ).join(',')}}`;
+}
+
+function safeString(
+    value,
+    max = 512,
+) {
+    if (
+        typeof value !== 'string'
+    ) {
+        return '';
+    }
+
+    return value.length > max
+        ? value.slice(0, max)
+        : value;
+}
+
+function validateId(
+    value,
+    field,
+    max = 256,
+) {
+    if (
+        typeof value !== 'string' ||
+        value.length < 1 ||
+        value.length > max
+    ) {
+        const error =
+            new Error(
+                `Invalid ${field}`,
+            );
+
+        error.code =
+            'invalid_request';
+
+        throw error;
     }
 
     return value;
 }
 
-function validateDeviceId(
-    deviceId,
-) {
-    const value =
-        cleanString(
-            deviceId,
-            MAX_ID_LENGTH,
-        );
 
-    return value || 'unknown';
-}
+/* -------------------------------------------------------------------------- */
+/* Scope/auth                                                                  */
+/* -------------------------------------------------------------------------- */
 
-function validateChatKey(
-    chatKey,
-) {
-    const value =
-        cleanString(
-            chatKey,
-            MAX_CHAT_KEY_LENGTH,
-        );
-
-    return value || null;
-}
-
-function validateJoinBody(
-    body,
-) {
-    if (!isPlainObject(body)) {
-        return {
-            ok: false,
-            error: 'Request body must be an object',
-        };
-    }
-
-    const clientId =
-        validateClientId(
-            body.clientId,
-        );
-
-    const chatKey =
-        validateChatKey(
-            body.chatKey,
-        ) || buildChatKey(body);
-
-    if (!clientId) {
-        return {
-            ok: false,
-            error: 'Valid clientId is required',
-        };
-    }
-
-    if (!chatKey) {
-        return {
-            ok: false,
-            error:
-                'Valid chat identity is required',
-        };
-    }
-
-    const derivedChatKey =
-        buildChatKey(body);
-
+function normalizeScope(raw) {
     if (
-        body.chatKey &&
-        derivedChatKey &&
-        body.chatKey !== derivedChatKey
+        !raw ||
+        typeof raw !== 'object'
     ) {
-        return {
-            ok: false,
-            error:
-                'chatKey does not match supplied chat identity',
-        };
-    }
-
-    const lastSequence =
-        Number(body.lastSequence);
-
-    return {
-        ok: true,
-        clientId,
-        deviceId:
-            validateDeviceId(
-                body.deviceId,
-            ),
-        chatKey,
-        lastSequence:
-            Number.isSafeInteger(
-                lastSequence,
-            ) && lastSequence >= 0
-                ? lastSequence
-                : 0,
-    };
-}
-
-function validateEventBody(
-    body,
-) {
-    if (!isPlainObject(body)) {
-        return {
-            ok: false,
-            error:
-                'Request body must be an object',
-        };
-    }
-
-    const clientId =
-        validateClientId(
-            body.clientId,
-        );
-
-    const chatKey =
-        validateChatKey(
-            body.chatKey,
-        );
-
-    if (!clientId) {
-        return {
-            ok: false,
-            error: 'Valid clientId is required',
-        };
-    }
-
-    if (!chatKey) {
-        return {
-            ok: false,
-            error: 'chatKey is required',
-        };
-    }
-
-    if (!isPlainObject(body.event)) {
-        return {
-            ok: false,
-            error: 'event object is required',
-        };
-    }
-
-    const eventId =
-        cleanString(
-            body.event.eventId,
-            MAX_EVENT_ID_LENGTH,
-        );
-
-    const type =
-        cleanString(
-            body.event.type,
-            MAX_ID_LENGTH,
-        );
-
-    if (!eventId) {
-        return {
-            ok: false,
-            error:
-                'event.eventId is required',
-        };
-    }
-
-    if (!ALLOWED_EVENT_TYPES.has(type)) {
-        return {
-            ok: false,
-            error:
-                `Unsupported event type: ${type}`,
-        };
-    }
-
-    if (
-        byteLength(body.event) >
-        MAX_EVENT_BYTES
-    ) {
-        return {
-            ok: false,
-            error:
-                'Event payload is too large',
-        };
-    }
-
-    return {
-        ok: true,
-        clientId,
-        deviceId:
-            validateDeviceId(
-                body.deviceId,
-            ),
-        chatKey,
-        event:
-            safeClone(body.event),
-    };
-}
-
-// ---------------------------------------------------------------------------
-// Group state
-// ---------------------------------------------------------------------------
-
-function createGroup(
-    userHandle,
-    chatKey,
-) {
-    return {
-        userHandle,
-        chatKey,
-        scopeKey:
-            scopeKey(
-                userHandle,
-                chatKey,
-            ),
-
-        /**
-         * Authoritative per-chat sequence.
-         */
-        sequence: 0,
-
-        /**
-         * Oldest retained sequence after
-         * history pruning.
-         */
-        oldestSequence: 1,
-
-        /**
-         * @type {Array<object>}
-         */
-        events: [],
-
-        /**
-         * Recent event IDs for duplicate
-         * detection.
-         *
-         * eventId -> {clientId, sequence}
-         */
-        eventIds: new Map(),
-
-        /**
-         * Client membership:
-         *
-         * clientId -> {
-         *   clientId,
-         *   deviceId,
-         *   userHandle,
-         *   joinedAt,
-         *   lastHeartbeat,
-         *   response
-         * }
-         */
-        clients: new Map(),
-
-        /**
-         * Current generation state or null.
-         */
-        generation: null,
-
-        createdAt: Date.now(),
-        lastActivityAt: Date.now(),
-    };
-}
-
-function getOrCreateGroup(
-    userHandle,
-    chatKey,
-) {
-    const key =
-        scopeKey(
-            userHandle,
-            chatKey,
-        );
-
-    let group =
-        groups.get(key);
-
-    if (!group) {
-        if (
-            groups.size >=
-            MAX_GROUPS
-        ) {
-            cleanupGroups();
-
-            if (
-                groups.size >=
-                MAX_GROUPS
-            ) {
-                throw new Error(
-                    'Synchronization server is at group capacity',
-                );
-            }
-        }
-
-        group =
-            createGroup(
-                userHandle,
-                chatKey,
+        const error =
+            new Error(
+                'Missing scope',
             );
 
-        groups.set(
-            key,
-            group,
-        );
+        error.code =
+            'invalid_scope';
+
+        throw error;
     }
 
-    group.lastActivityAt =
-        Date.now();
+    const scopeType =
+        raw.scopeType === 'group'
+            ? 'group'
+            : raw.scopeType === 'character'
+                ? 'character'
+                : null;
 
-    return group;
-}
-
-function getGroupForUser(
-    userHandle,
-    chatKey,
-) {
-    return groups.get(
-        scopeKey(
-            userHandle,
-            chatKey,
-        ),
-    ) || null;
-}
-
-function touchClient(
-    group,
-    clientId,
-    metadata = {},
-) {
-    const client =
-        group.clients.get(
-            clientId,
-        );
-
-    if (!client) {
-        return null;
-    }
-
-    client.lastHeartbeat =
-        Date.now();
-
-    if (metadata.deviceId) {
-        client.deviceId =
-            metadata.deviceId;
-    }
-
-    group.lastActivityAt =
-        Date.now();
-
-    return client;
-}
-
-// ---------------------------------------------------------------------------
-// SSE
-// ---------------------------------------------------------------------------
-
-function writeSse(
-    res,
-    data,
-) {
-    if (
-        !res ||
-        res.writableEnded ||
-        res.destroyed
-    ) {
-        return false;
-    }
-
-    try {
-        res.write(
-            `data: ${JSON.stringify(
-                data,
-            )}\n\n`,
-        );
-
-        return true;
-    } catch (e) {
-        return false;
-    }
-}
-
-function writeSseComment(
-    res,
-    text = 'keepalive',
-) {
-    if (
-        !res ||
-        res.writableEnded ||
-        res.destroyed
-    ) {
-        return false;
-    }
-
-    try {
-        res.write(
-            `: ${text}\n\n`,
-        );
-
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-function closeSseConnection(
-    member,
-) {
-    if (!member?.response) {
-        return;
-    }
-
-    const response =
-        member.response;
-
-    member.response = null;
-
-    try {
-        response.end();
-    } catch {
-        try {
-            response.destroy();
-        } catch {
-            // ignore
-        }
-    }
-}
-
-function attachSse(
-    group,
-    member,
-    req,
-    res,
-) {
-    if (member.response) {
-        closeSseConnection(
-            member,
-        );
-    }
-
-    res.statusCode = 200;
-
-    res.setHeader(
-        'Content-Type',
-        'text/event-stream',
-    );
-
-    res.setHeader(
-        'Cache-Control',
-        'no-cache, no-transform',
-    );
-
-    res.setHeader(
-        'Connection',
-        'keep-alive',
-    );
-
-    res.setHeader(
-        'X-Accel-Buffering',
-        'no',
-    );
-
-    if (
-        typeof res.flushHeaders ===
-        'function'
-    ) {
-        res.flushHeaders();
-    }
-
-    member.response = res;
-
-    writeSse(
-        res,
-        {
-            type: 'CONNECTED',
-            chatKey:
-                group.chatKey,
-            sequence:
-                group.sequence,
-            serverInstanceId,
-        },
-    );
-
-    const cleanupConnection =
-        () => {
-            if (
-                member.response ===
-                res
-            ) {
-                member.response = null;
-            }
-        };
-
-    res.on(
-        'close',
-        cleanupConnection,
-    );
-
-    res.on(
-        'error',
-        cleanupConnection,
-    );
-
-    req.on(
-        'close',
-        cleanupConnection,
-    );
-
-    log(
-        'SSE attached',
-        member.clientId,
-        group.chatKey,
-    );
-}
-
-function broadcast(
-    group,
-    event,
-) {
-    for (
-        const member of
-        group.clients.values()
-    ) {
-        if (!member.response) {
-            continue;
-        }
-
-        const ok =
-            writeSse(
-                member.response,
-                event,
+    if (!scopeType) {
+        const error =
+            new Error(
+                'Invalid scopeType',
             );
 
-        if (!ok) {
-            member.response = null;
-        }
-    }
-}
+        error.code =
+            'invalid_scope';
 
-function broadcastComment(
-    group,
-) {
-    for (
-        const member of
-        group.clients.values()
-    ) {
-        if (!member.response) {
-            continue;
-        }
-
-        const ok =
-            writeSseComment(
-                member.response,
-            );
-
-        if (!ok) {
-            member.response = null;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Event history
-// ---------------------------------------------------------------------------
-
-function pruneEventHistory(
-    group,
-) {
-    while (
-        group.events.length >
-        MAX_EVENTS_PER_GROUP
-    ) {
-        const removed =
-            group.events.shift();
-
-        if (
-            removed?.eventId
-        ) {
-            group.eventIds.delete(
-                removed.eventId,
-            );
-        }
+        throw error;
     }
 
-    group.oldestSequence =
-        group.events.length > 0
-            ? group.events[0].sequence
-            : group.sequence + 1;
-}
-
-function findStoredEvent(
-    group,
-    eventId,
-) {
-    const metadata =
-        group.eventIds.get(
-            eventId,
+    const chatId =
+        validateId(
+            raw.chatId,
+            'chatId',
+            1024,
         );
 
-    if (!metadata) {
-        return null;
-    }
-
-    const event =
-        group.events.find(
-            (item) =>
-                item.sequence ===
-                metadata.sequence,
-        );
-
-    if (!event) {
-        return null;
-    }
-
-    return event;
-}
-
-function appendEvent(
-    group,
-    incomingEvent,
-    source,
-) {
-    const event = {
-        eventId:
-            cleanString(
-                incomingEvent.eventId ||
-                    randomId(),
-                MAX_EVENT_ID_LENGTH,
-            ),
-
-        clientId:
-            cleanString(
-                source.clientId,
-                MAX_ID_LENGTH,
-            ),
-
-        deviceId:
-            cleanString(
-                source.deviceId ||
-                    'unknown',
-                MAX_ID_LENGTH,
-            ),
-
-        userId:
-            group.userHandle,
-
-        chatKey:
-            group.chatKey,
-
-        type:
-            cleanString(
-                incomingEvent.type,
-                MAX_ID_LENGTH,
-            ),
-
-        payload:
-            safeClone(
-                incomingEvent.payload,
-            ),
-
-        generationId:
-            incomingEvent.generationId ||
-            undefined,
-
-        streamSeq:
-            incomingEvent.streamSeq ||
-            undefined,
-
-        timestamp:
-            Number.isFinite(
-                Number(
-                    incomingEvent.timestamp,
+    const characterId =
+        raw.characterId === null ||
+        raw.characterId === undefined
+            ? null
+            : safeString(
+                String(
+                    raw.characterId,
                 ),
-            )
-                ? Number(
-                    incomingEvent.timestamp,
-                )
-                : Date.now(),
+                128,
+            );
+
+    const groupId =
+        raw.groupId === null ||
+        raw.groupId === undefined
+            ? null
+            : safeString(
+                String(
+                    raw.groupId,
+                ),
+                256,
+            );
+
+    if (
+        scopeType === 'character' &&
+        !characterId
+    ) {
+        const error =
+            new Error(
+                'characterId required for character scope',
+            );
+
+        error.code =
+            'invalid_scope';
+
+        throw error;
+    }
+
+    if (
+        scopeType === 'group' &&
+        !groupId
+    ) {
+        const error =
+            new Error(
+                'groupId required for group scope',
+            );
+
+        error.code =
+            'invalid_scope';
+
+        throw error;
+    }
+
+    return {
+        scopeType,
+        chatId,
+
+        characterId:
+            scopeType === 'character'
+                ? characterId
+                : null,
+
+        groupId:
+            scopeType === 'group'
+                ? groupId
+                : null,
     };
-
-    group.sequence += 1;
-
-    event.sequence =
-        group.sequence;
-
-    group.events.push(
-        event,
-    );
-
-    group.eventIds.set(
-        event.eventId,
-        {
-            clientId:
-                event.clientId,
-            sequence:
-                event.sequence,
-        },
-    );
-
-    pruneEventHistory(
-        group,
-    );
-
-    group.lastActivityAt =
-        Date.now();
-
-    broadcast(
-        group,
-        event,
-    );
-
-    return event;
 }
 
-function appendServerEvent(
-    group,
-    type,
-    payload = {},
+function userIdFromRequest(
+    req,
+) {
+    /*
+     * The browser never supplies the authoritative user identity.
+     *
+     * ST's authenticated middleware supplies req.user. We derive the sync
+     * namespace from that authenticated identity.
+     */
+    const handle =
+        req?.user?.profile?.handle ??
+        req?.user?.handle ??
+        req?.user?.name;
+
+    return (
+        safeString(
+            handle
+                ? String(handle)
+                : 'default',
+            256,
+        ) ||
+        'default'
+    );
+}
+
+function scopeKey(
+    userId,
+    scope,
+) {
+    return JSON.stringify({
+        userId,
+        ...scope,
+    });
+}
+
+function scopeHash(key) {
+    return crypto
+        .createHash('sha256')
+        .update(key)
+        .digest('hex');
+}
+
+function eventId(seq) {
+    return `${runtimeEpoch}:${seq}`;
+}
+
+function parseEventCursor(
+    value,
+) {
+    if (!value) {
+        return null;
+    }
+
+    const text =
+        String(value);
+
+    const index =
+        text.lastIndexOf(':');
+
+    if (index <= 0) {
+        return null;
+    }
+
+    const epoch =
+        text.slice(
+            0,
+            index,
+        );
+
+    const seq =
+        Number(
+            text.slice(
+                index + 1,
+            ),
+        );
+
+    if (
+        !Number.isSafeInteger(seq) ||
+        seq < 0
+    ) {
+        return null;
+    }
+
+    return {
+        epoch,
+        seq,
+    };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* HTTP helpers                                                                */
+/* -------------------------------------------------------------------------- */
+
+function httpError(
+    res,
+    status,
+    code,
+    message,
     extra = {},
 ) {
-    return appendEvent(
-        group,
-        {
-            eventId:
-                `server-${randomId()}`,
+    res.status(status).json({
+        ok: false,
+        code,
+        message,
+        ...extra,
+    });
+}
 
-            type,
-            payload,
-
-            timestamp:
-                Date.now(),
-
-            ...extra,
-        },
-        {
-            clientId:
-                'server',
-            deviceId:
-                'server',
-        },
+function ok(
+    res,
+    payload = {},
+) {
+    res.setHeader(
+        'Cache-Control',
+        'no-store',
     );
-}
 
-// ---------------------------------------------------------------------------
-// Generation state
-// ---------------------------------------------------------------------------
-
-function serializeGeneration(
-    generation,
-) {
-    if (!generation) {
-        return null;
-    }
-
-    return {
-        generationId:
-            generation.generationId,
-
-        ownerId:
-            generation.ownerId,
-
-        ownerDevice:
-            generation.ownerDevice,
-
-        status:
-            generation.status,
-
-        startedAt:
-            generation.startedAt,
-
-        serverSequence:
-            generation.serverSequence,
-
-        streamSeq:
-            generation.streamSeq,
-
-        streamSeqApplied:
-            generation.streamSeq,
-
-        messageId:
-            generation.messageId,
-
-        messageKey:
-            generation.messageKey,
-
-        currentText:
-            generation.currentText,
-
-        lastActivityAt:
-            generation.lastActivityAt,
-    };
-}
-
-function getCurrentGeneration(
-    group,
-) {
-    return group.generation;
-}
-
-function generationMatches(
-    group,
-    event,
-) {
-    return (
-        group.generation &&
-        group.generation.generationId ===
-            event.generationId
-    );
-}
-
-function updateGenerationTextFromPayload(
-    generation,
-    payload,
-) {
-    if (
-        !generation ||
-        !payload
-    ) {
-        return;
-    }
-
-    if (
-        isPlainObject(
-            payload.message,
-        ) &&
-        typeof payload.message.mes ===
-            'string'
-    ) {
-        generation.currentText =
-            payload.message.mes;
-    } else if (
-        typeof payload.currentText ===
-        'string'
-    ) {
-        generation.currentText =
-            payload.currentText;
-    }
-}
-
-function startGeneration(
-    group,
-    event,
-    source,
-) {
-    if (
-        group.generation &&
-        group.generation.status ===
-            'active'
-    ) {
-        if (
-            group.generation.generationId ===
-            event.generationId &&
-            group.generation.ownerId ===
-            source.clientId
-        ) {
-            return {
-                ok: true,
-                duplicate: true,
-            };
-        }
-
-        return {
-            ok: false,
-            status: 409,
-            error:
-                'generation_already_active',
-        };
-    }
-
-    if (
-        !event.generationId
-    ) {
-        return {
-            ok: false,
-            status: 400,
-            error:
-                'generationId is required',
-        };
-    }
-
-    const payload =
-        isPlainObject(
-            event.payload,
-        )
-            ? event.payload
-            : {};
-
-    const generation = {
-        generationId:
-            cleanString(
-                event.generationId,
-                MAX_ID_LENGTH,
-            ),
-
-        ownerId:
-            source.clientId,
-
-        ownerDevice:
-            source.deviceId,
-
-        status:
-            'active',
-
-        startedAt:
-            Number.isFinite(
-                Number(
-                    event.timestamp,
-                ),
-            )
-                ? Number(
-                    event.timestamp,
-                )
-                : Date.now(),
-
-        serverSequence:
-            group.sequence + 1,
-
-        streamSeq:
-            0,
-
-        messageId:
-            Number.isInteger(
-                payload.messageId,
-            )
-                ? payload.messageId
-                : Number.isInteger(
-                    payload.insertAt,
-                )
-                    ? payload.insertAt
-                    : null,
-
-        messageKey:
-            payload.messageKey ||
-            null,
-
-        currentText:
-            isPlainObject(
-                payload.message,
-            ) &&
-            typeof payload.message.mes ===
-                'string'
-                ? payload.message.mes
-                : '',
-
-        lastActivityAt:
-            Date.now(),
-    };
-
-    group.generation =
-        generation;
-
-    const accepted =
-        appendEvent(
-            group,
-            event,
-            source,
-        );
-
-    generation.serverSequence =
-        accepted.sequence;
-
-    return {
+    res.json({
         ok: true,
-        duplicate: false,
-        event: accepted,
-    };
+        ...payload,
+    });
 }
 
-function updateGenerationStream(
-    group,
-    event,
-    source,
-) {
-    const generation =
-        group.generation;
-
-    if (!generation) {
-        return {
-            ok: false,
-            status: 409,
-            error:
-                'no_active_generation',
-        };
-    }
-
-    if (
-        generation.generationId !==
-        event.generationId
-    ) {
-        return {
-            ok: false,
-            status: 409,
-            error:
-                'generation_id_mismatch',
-        };
-    }
-
-    if (
-        generation.ownerId !==
-        source.clientId
-    ) {
-        return {
-            ok: false,
-            status: 403,
-            error:
-                'generation_owner_required',
-        };
-    }
-
-    const streamSeq =
-        Number(
-            event.streamSeq,
-        );
-
-    if (
-        !Number.isSafeInteger(
-            streamSeq,
-        ) ||
-        streamSeq <= 0
-    ) {
-        return {
-            ok: false,
-            status: 400,
-            error:
-                'valid streamSeq is required',
-        };
-    }
-
-    if (
-        streamSeq <=
-        generation.streamSeq
-    ) {
-        return {
-            ok: false,
-            status: 409,
-            error:
-                'stale_stream_sequence',
-        };
-    }
-
-    const payload =
-        isPlainObject(
-            event.payload,
-        )
-            ? event.payload
-            : {};
-
-    updateGenerationTextFromPayload(
-        generation,
-        payload,
-    );
-
-    generation.streamSeq =
-        streamSeq;
-
-    generation.lastActivityAt =
-        Date.now();
-
-    const accepted =
-        appendEvent(
-            group,
-            event,
-            source,
-        );
-
-    return {
-        ok: true,
-        event: accepted,
-    };
-}
-
-function finishGeneration(
-    group,
-    event,
-    source,
-) {
-    const generation =
-        group.generation;
-
-    if (!generation) {
-        return {
-            ok: false,
-            status: 409,
-            error:
-                'no_active_generation',
-        };
-    }
-
-    if (
-        generation.generationId !==
-        event.generationId
-    ) {
-        return {
-            ok: false,
-            status: 409,
-            error:
-                'generation_id_mismatch',
-        };
-    }
-
-    if (
-        generation.ownerId !==
-        source.clientId
-    ) {
-        return {
-            ok: false,
-            status: 403,
-            error:
-                'generation_owner_required',
-        };
-    }
-
-    updateGenerationTextFromPayload(
-        generation,
-        isPlainObject(
-            event.payload,
-        )
-            ? event.payload
-            : {},
-    );
-
-    generation.lastActivityAt =
-        Date.now();
-
-    const accepted =
-        appendEvent(
-            group,
-            event,
-            source,
-        );
-
-    group.generation =
-        null;
-
-    return {
-        ok: true,
-        event: accepted,
-    };
-}
-
-function terminateOrphanedGeneration(
-    group,
-    reason,
-) {
-    const generation =
-        group.generation;
-
-    if (!generation) {
-        return;
-    }
-
-    const generationId =
-        generation.generationId;
-
-    const ownerId =
-        generation.ownerId;
-
-    appendServerEvent(
-        group,
-        'GENERATION_OWNER_RELEASED',
-        {
-            ownerId,
-            ownerDevice:
-                generation.ownerDevice,
-            reason,
-        },
-        {
-            generationId,
-        },
-    );
-
-    appendServerEvent(
-        group,
-        'GENERATION_FAILED',
-        {
-            reason:
-                'generation_owner_lost',
-            ownerId,
-            ownerDevice:
-                generation.ownerDevice,
-            messageKey:
-                generation.messageKey,
-            messageId:
-                generation.messageId,
-            finalText:
-                generation.currentText,
-        },
-        {
-            generationId,
-        },
-    );
-
-    group.generation =
-        null;
-
-    log(
-        'terminated orphaned generation',
-        generationId,
-        reason,
-        group.chatKey,
+function noStore(res) {
+    res.setHeader(
+        'Cache-Control',
+        'no-store',
     );
 }
 
-// ---------------------------------------------------------------------------
-// Event authorization / application
-// ---------------------------------------------------------------------------
 
-function handleEvent(
-    group,
-    incomingEvent,
-    source,
+/* -------------------------------------------------------------------------- */
+/* Snapshot validation                                                         */
+/* -------------------------------------------------------------------------- */
+
+function validateSnapshot(
+    snapshot,
 ) {
-    const event = {
-        ...incomingEvent,
-        clientId:
-            source.clientId,
-        deviceId:
-            source.deviceId,
-        chatKey:
-            group.chatKey,
-        userId:
-            group.userHandle,
-    };
-
-    const existing =
-        findStoredEvent(
-            group,
-            event.eventId,
-        );
-
-    if (existing) {
-        if (
-            existing.clientId !==
-            source.clientId
-        ) {
-            return {
-                ok: false,
-                status: 409,
-                error:
-                    'event_id_conflict',
-            };
-        }
-
-        return {
-            ok: true,
-            duplicate: true,
-            event: existing,
-            sequence:
-                existing.sequence,
-        };
-    }
-
-    const type =
-        event.type;
-
     if (
-        type ===
-        'GENERATION_STARTED'
+        !snapshot ||
+        typeof snapshot !== 'object'
     ) {
-        return startGeneration(
-            group,
-            event,
-            source,
-        );
-    }
-
-    if (
-        type ===
-        'GENERATION_STREAM'
-    ) {
-        return updateGenerationStream(
-            group,
-            event,
-            source,
-        );
-    }
-
-    if (
-        type ===
-        'GENERATION_STOP_REQUESTED'
-    ) {
-        if (
-            !group.generation
-        ) {
-            return {
-                ok: false,
-                status: 409,
-                error:
-                    'no_active_generation',
-            };
-        }
-
-        if (
-            group.generation.generationId !==
-            event.generationId
-        ) {
-            return {
-                ok: false,
-                status: 409,
-                error:
-                    'generation_id_mismatch',
-            };
-        }
-
-        /*
-         * Any authorized member may request
-         * that the owner stop the active
-         * generation.
-         */
-        const accepted =
-            appendEvent(
-                group,
-                event,
-                source,
+        const error =
+            new Error(
+                'Missing snapshot',
             );
 
-        return {
-            ok: true,
-            event: accepted,
-        };
+        error.code =
+            'invalid_snapshot';
+
+        throw error;
     }
 
     if (
-        type ===
-            'GENERATION_STOPPED' ||
-        type ===
-            'GENERATION_COMPLETED' ||
-        type ===
-            'GENERATION_FAILED'
+        !Array.isArray(
+            snapshot.chat,
+        )
     ) {
-        return finishGeneration(
-            group,
-            event,
-            source,
-        );
+        const error =
+            new Error(
+                'snapshot.chat must be an array',
+            );
+
+        error.code =
+            'invalid_snapshot';
+
+        throw error;
     }
 
     if (
-        type ===
-        'GENERATION_OWNER_RELEASED'
+        snapshot.chat.length >
+        100_000
     ) {
-        const generation =
-            group.generation;
+        const error =
+            new Error(
+                'Chat is too large',
+            );
 
-        if (!generation) {
-            return {
-                ok: false,
-                status: 409,
-                error:
-                    'no_active_generation',
-            };
-        }
+        error.code =
+            'snapshot_too_large';
 
-        if (
-            generation.generationId !==
-            event.generationId
-        ) {
-            return {
-                ok: false,
-                status: 409,
-                error:
-                    'generation_id_mismatch',
-            };
-        }
-
-        if (
-            generation.ownerId !==
-            source.clientId
-        ) {
-            return {
-                ok: false,
-                status: 403,
-                error:
-                    'generation_owner_required',
-            };
-        }
-
-        appendEvent(
-            group,
-            event,
-            source,
-        );
-
-        appendServerEvent(
-            group,
-            'GENERATION_FAILED',
-            {
-                reason:
-                    'generation_owner_released',
-                ownerId:
-                    generation.ownerId,
-                ownerDevice:
-                    generation.ownerDevice,
-                messageKey:
-                    generation.messageKey,
-                messageId:
-                    generation.messageId,
-                finalText:
-                    generation.currentText,
-            },
-            {
-                generationId:
-                    generation.generationId,
-            },
-        );
-
-        group.generation =
-            null;
-
-        return {
-            ok: true,
-        };
-    }
-
-    /*
-     * Normal chat mutations.
-     */
-    const accepted =
-        appendEvent(
-            group,
-            event,
-            source,
-        );
-
-    return {
-        ok: true,
-        event: accepted,
-    };
-}
-
-// ---------------------------------------------------------------------------
-// Recovery
-// ---------------------------------------------------------------------------
-
-function buildJoinReplay(
-    group,
-    lastSequence,
-) {
-    const headSequence =
-        group.sequence;
-
-    if (
-        lastSequence >=
-        headSequence
-    ) {
-        return {
-            recoveryRequired: false,
-            missedEvents: [],
-        };
+        throw error;
     }
 
     if (
-        group.events.length ===
-        0
+        snapshot.chatMetadata !==
+            undefined &&
+        (
+            snapshot.chatMetadata === null ||
+            typeof snapshot.chatMetadata !==
+                'object' ||
+            Array.isArray(
+                snapshot.chatMetadata,
+            )
+        )
     ) {
-        return {
-            recoveryRequired:
-                lastSequence >
-                headSequence,
-            missedEvents: [],
-        };
+        const error =
+            new Error(
+                'snapshot.chatMetadata must be an object',
+            );
+
+        error.code =
+            'invalid_snapshot';
+
+        throw error;
     }
 
-    const earliestAvailable =
-        group.events[0].sequence;
-
-    /*
-     * The requested starting point is
-     * older than the retained history.
-     *
-     * The client must fall back to its
-     * authoritative SillyTavern chat reload.
-     */
-    if (
-        lastSequence <
-        earliestAvailable - 1
-    ) {
-        return {
-            recoveryRequired: true,
-            missedEvents: [],
-        };
-    }
-
-    const missed =
-        group.events.filter(
-            (event) =>
-                event.sequence >
-                lastSequence,
+    const bytes =
+        jsonBytes(
+            snapshot,
         );
 
-    /*
-     * Don't send enormous replay
-     * payloads to a reconnecting browser.
-     * Force authoritative reload instead.
-     */
     if (
-        missed.length >
-        MAX_JOIN_REPLAY_EVENTS
+        bytes >
+        MAX_EVENT_BYTES
     ) {
-        return {
-            recoveryRequired: true,
-            missedEvents: [],
-        };
+        const error =
+            new Error(
+                `Snapshot exceeds ${MAX_EVENT_BYTES} bytes`,
+            );
+
+        error.code =
+            'snapshot_too_large';
+
+        throw error;
     }
-
-    return {
-        recoveryRequired: false,
-        missedEvents:
-            safeClone(missed),
-    };
-}
-
-// ---------------------------------------------------------------------------
-// Cleanup
-// ---------------------------------------------------------------------------
-
-function removeClient(
-    group,
-    clientId,
-) {
-    const member =
-        group.clients.get(
-            clientId,
-        );
-
-    if (!member) {
-        return false;
-    }
-
-    closeSseConnection(
-        member,
-    );
-
-    group.clients.delete(
-        clientId,
-    );
-
-    group.lastActivityAt =
-        Date.now();
 
     return true;
 }
 
-function cleanupStaleClients() {
-    const now =
-        Date.now();
 
-    for (
-        const group of
-        groups.values()
+/* -------------------------------------------------------------------------- */
+/* Scope records                                                               */
+/* -------------------------------------------------------------------------- */
+
+function ensureScopeRecord(
+    key,
+    userId,
+    scope,
+) {
+    let record =
+        scopes.get(key);
+
+    if (!record) {
+        record = {
+            schemaVersion:
+                STATE_SCHEMA_VERSION,
+
+            key,
+
+            userId,
+
+            scope:
+                clone(scope),
+
+            serverEpoch:
+                runtimeEpoch,
+
+            revision:
+                0,
+
+            seq:
+                0,
+
+            snapshot:
+                null,
+
+            snapshotHash:
+                null,
+
+            events:
+                [],
+
+            seenOps:
+                [],
+
+            members:
+                new Map(),
+
+            generation:
+                null,
+
+            stopRequestIds:
+                new Set(),
+
+            persistVersion:
+                0,
+        };
+
+        scopes.set(
+            key,
+            record,
+        );
+    }
+
+    return record;
+}
+
+function publicState(
+    record,
+) {
+    return {
+        protocolVersion:
+            PROTOCOL_VERSION,
+
+        schemaVersion:
+            STATE_SCHEMA_VERSION,
+
+        epoch:
+            runtimeEpoch,
+
+        revision:
+            record.revision,
+
+        seq:
+            record.seq,
+
+        snapshot:
+            record.snapshot
+                ? clone(
+                    record.snapshot,
+                )
+                : null,
+
+        snapshotHash:
+            record.snapshotHash,
+
+        generation:
+            record.generation
+                ? clone(
+                    record.generation,
+                )
+                : null,
+
+        memberCount:
+            record.members.size,
+    };
+}
+
+function compactGeneration(
+    generation,
+) {
+    if (!generation) {
+        return null;
+    }
+
+    return {
+        id:
+            generation.id,
+
+        ownerClientId:
+            generation.ownerClientId,
+
+        ownerDeviceId:
+            generation.ownerDeviceId,
+
+        state:
+            generation.state,
+
+        leaseUntil:
+            generation.leaseUntil,
+
+        startedAt:
+            generation.startedAt,
+
+        streamSeq:
+            generation.streamSeq,
+
+        stopRequested:
+            Boolean(
+                generation.stopRequested,
+            ),
+
+        stopRequesterClientId:
+            generation.stopRequesterClientId ||
+            null,
+    };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Events                                                                      */
+/* -------------------------------------------------------------------------- */
+
+function makeEvent(
+    record,
+    {
+        type,
+        opId = null,
+        sourceClientId = null,
+        sourceDeviceId = null,
+        payload = {},
+        includeSnapshot = false,
+        generation = null,
+    },
+) {
+    record.seq += 1;
+
+    const event = {
+        id:
+            eventId(
+                record.seq,
+            ),
+
+        epoch:
+            runtimeEpoch,
+
+        seq:
+            record.seq,
+
+        revision:
+            record.revision,
+
+        timestamp:
+            now(),
+
+        type,
+
+        opId,
+
+        sourceClientId,
+
+        sourceDeviceId,
+
+        payload:
+            clone(payload),
+
+        generation:
+            generation
+                ? compactGeneration(
+                    generation,
+                )
+                : null,
+    };
+
+    if (
+        includeSnapshot &&
+        record.snapshot
     ) {
-        const staleClients = [];
-
-        for (
-            const member of
-            group.clients.values()
-        ) {
-            if (
-                now -
-                member.lastHeartbeat >
-                CLIENT_TTL_MS
-            ) {
-                staleClients.push(
-                    member,
-                );
-            }
-        }
-
-        for (
-            const member of staleClients
-        ) {
-            const wasOwner =
-                group.generation &&
-                group.generation.ownerId ===
-                    member.clientId;
-
-            if (wasOwner) {
-                terminateOrphanedGeneration(
-                    group,
-                    'heartbeat_expired',
-                );
-            }
-
-            removeClient(
-                group,
-                member.clientId,
+        event.snapshot =
+            clone(
+                record.snapshot,
             );
+    }
 
-            log(
-                'removed stale client',
-                member.clientId,
-                group.chatKey,
-            );
-        }
+    /*
+     * Streaming snapshots are delivered live but are deliberately not retained
+     * as full copies in the replay history. A replay through a stream event
+     * causes /state recovery instead.
+     */
+    const storedEvent =
+        event.type ===
+            'generation_stream'
+            ? {
+                ...event,
+                snapshot:
+                    undefined,
+            }
+            : event;
+
+    if (
+        storedEvent.snapshot ===
+            undefined
+    ) {
+        delete storedEvent.snapshot;
+    }
+
+    record.events.push(
+        storedEvent,
+    );
+
+    if (
+        record.events.length >
+        MAX_EVENTS
+    ) {
+        record.events.splice(
+            0,
+            record.events.length -
+                MAX_EVENTS,
+        );
+    }
+
+    return event;
+}
+
+function rememberOp(
+    record,
+    opId,
+) {
+    if (!opId) {
+        return;
+    }
+
+    record.seenOps.push(
+        opId,
+    );
+
+    if (
+        record.seenOps.length >
+        MAX_SEEN_OPS
+    ) {
+        record.seenOps.splice(
+            0,
+            record.seenOps.length -
+                MAX_SEEN_OPS,
+        );
     }
 }
 
-function cleanupGroups() {
-    cleanupStaleClients();
+function hasSeenOp(
+    record,
+    opId,
+) {
+    return Boolean(
+        opId &&
+        record.seenOps.includes(
+            opId,
+        ),
+    );
+}
 
-    const now =
-        Date.now();
 
-    for (
-        const [
-            key,
-            group,
-        ] of groups
-    ) {
-        if (
-            group.clients.size === 0 &&
-            !group.generation &&
-            now -
-                group.lastActivityAt >
-                EMPTY_GROUP_RETENTION_MS
-        ) {
-            groups.delete(
-                key,
-            );
-        }
+/* -------------------------------------------------------------------------- */
+/* SSE                                                                          */
+/* -------------------------------------------------------------------------- */
+
+function sendSse(
+    res,
+    event,
+    data,
+    id = null,
+) {
+    if (res.writableEnded) {
+        return;
     }
 
+    if (id !== null) {
+        res.write(
+            `id: ${id}\n`,
+        );
+    }
+
+    if (event) {
+        res.write(
+            `event: ${event}\n`,
+        );
+    }
+
+    const text =
+        JSON.stringify(
+            data,
+        );
+
+    for (
+        const line of text.split('\n')
+    ) {
+        res.write(
+            `data: ${line}\n`,
+        );
+    }
+
+    res.write('\n');
+}
+
+function broadcast(
+    record,
+    event,
+) {
+    const clients =
+        sseByScope.get(
+            record.key,
+        );
+
     if (
-        groups.size <=
-        MAX_GROUPS
+        !clients ||
+        clients.size === 0
     ) {
         return;
     }
 
+    const data = {
+        ...clone(event),
+
+        state: {
+            epoch:
+                runtimeEpoch,
+
+            revision:
+                record.revision,
+
+            seq:
+                record.seq,
+
+            snapshotHash:
+                record.snapshotHash,
+
+            generation:
+                record.generation
+                    ? compactGeneration(
+                        record.generation,
+                    )
+                    : null,
+        },
+    };
+
     /*
-     * Last-resort bounded-memory cleanup.
-     * Prefer groups with no active clients.
+     * Live delivery always carries the latest authoritative snapshot.
      */
-    const removable =
-        [...groups.values()]
-            .filter(
-                (group) =>
-                    group.clients.size ===
-                    0 &&
-                    !group.generation,
+    data.snapshot =
+        record.snapshot
+            ? clone(
+                record.snapshot,
             )
-            .sort(
-                (a, b) =>
-                    a.lastActivityAt -
-                    b.lastActivityAt,
-            );
+            : null;
 
-    while (
-        groups.size >
-            MAX_GROUPS &&
-        removable.length > 0
-    ) {
-        const group =
-            removable.shift();
-
-        groups.delete(
-            group.scopeKey,
-        );
-    }
-}
-
-function sendKeepalives() {
     for (
-        const group of
-        groups.values()
+        const res of clients
     ) {
-        if (
-            group.clients.size ===
-            0
-        ) {
-            continue;
+        try {
+            sendSse(
+                res,
+                'sync',
+                data,
+                event.id,
+            );
+        } catch {
+            try {
+                res.end();
+            } catch {
+                // ignored
+            }
         }
-
-        broadcastComment(
-            group,
-        );
     }
 }
 
-// ---------------------------------------------------------------------------
-// Routes
-// ---------------------------------------------------------------------------
 
-function registerRoutes(
-    router,
+/* -------------------------------------------------------------------------- */
+/* Persistence                                                                  */
+/* -------------------------------------------------------------------------- */
+
+async function atomicWrite(
+    file,
+    data,
 ) {
-    router.use(
-        express.json({
-            limit:
-                `${MAX_EVENT_BYTES}b`,
-        }),
+    const temp =
+        `${file}.${process.pid}.${Date.now()}.tmp`;
+
+    await fs.writeFile(
+        temp,
+        data,
+        'utf8',
     );
 
-    // -------------------------------------------------------
-    // Health
-    // -------------------------------------------------------
+    await fs.rename(
+        temp,
+        file,
+    );
+}
+
+function persistentView(
+    record,
+) {
+    return {
+        schemaVersion:
+            STATE_SCHEMA_VERSION,
+
+        key:
+            record.key,
+
+        userId:
+            record.userId,
+
+        scope:
+            record.scope,
+
+        revision:
+            record.revision,
+
+        seq:
+            record.seq,
+
+        snapshot:
+            record.snapshot,
+
+        snapshotHash:
+            record.snapshotHash,
+
+        events:
+            record.events,
+
+        seenOps:
+            record.seenOps,
+
+        generation:
+            record.generation
+                ? compactGeneration(
+                    record.generation,
+                )
+                : null,
+
+        persistedAt:
+            now(),
+    };
+}
+
+async function persistScope(
+    record,
+) {
+    try {
+        await fs.mkdir(
+            persistDir,
+            {
+                recursive:
+                    true,
+            },
+        );
+
+        const file =
+            path.join(
+                persistDir,
+                `${scopeHash(record.key)}.json`,
+            );
+
+        await atomicWrite(
+            file,
+            JSON.stringify(
+                persistentView(
+                    record,
+                ),
+            ),
+        );
+
+        record.persistVersion += 1;
+    } catch (error) {
+        console.error(
+            `[${PLUGIN_ID}] persistence failed for scope`,
+            record.key,
+            error,
+        );
+    }
+}
+
+function schedulePersist(
+    record,
+    immediate = false,
+) {
+    if (immediate) {
+        const current =
+            persistTimers.get(
+                record.key,
+            );
+
+        if (current) {
+            clearTimeout(
+                current,
+            );
+        }
+
+        persistTimers.delete(
+            record.key,
+        );
+
+        return persistScope(
+            record,
+        );
+    }
+
+    if (
+        persistTimers.has(
+            record.key,
+        )
+    ) {
+        return;
+    }
+
+    const timer =
+        setTimeout(
+            () => {
+                persistTimers.delete(
+                    record.key,
+                );
+
+                void persistScope(
+                    record,
+                );
+            },
+            PERSIST_DEBOUNCE_MS,
+        );
+
+    persistTimers.set(
+        record.key,
+        timer,
+    );
+}
+
+async function loadPersisted() {
+    try {
+        await fs.mkdir(
+            persistDir,
+            {
+                recursive:
+                    true,
+            },
+        );
+
+        const files =
+            await fs.readdir(
+                persistDir,
+            );
+
+        for (
+            const fileName of files
+        ) {
+            if (
+                !fileName.endsWith(
+                    '.json',
+                )
+            ) {
+                continue;
+            }
+
+            const file =
+                path.join(
+                    persistDir,
+                    fileName,
+                );
+
+            try {
+                const parsed =
+                    JSON.parse(
+                        await fs.readFile(
+                            file,
+                            'utf8',
+                        ),
+                    );
+
+                if (
+                    parsed?.schemaVersion !==
+                        STATE_SCHEMA_VERSION ||
+                    !parsed?.key ||
+                    !parsed?.scope ||
+                    !parsed?.userId
+                ) {
+                    continue;
+                }
+
+                const record =
+                    ensureScopeRecord(
+                        parsed.key,
+                        parsed.userId,
+                        parsed.scope,
+                    );
+
+                record.revision =
+                    Number.isSafeInteger(
+                        parsed.revision,
+                    )
+                        ? parsed.revision
+                        : 0;
+
+                record.seq =
+                    Number.isSafeInteger(
+                        parsed.seq,
+                    )
+                        ? parsed.seq
+                        : 0;
+
+                record.snapshot =
+                    parsed.snapshot
+                        ? clone(
+                            parsed.snapshot,
+                        )
+                        : null;
+
+                record.snapshotHash =
+                    typeof parsed.snapshotHash ===
+                        'string'
+                        ? parsed.snapshotHash
+                        : null;
+
+                record.events =
+                    Array.isArray(
+                        parsed.events,
+                    )
+                        ? parsed.events
+                            .slice(
+                                -MAX_EVENTS,
+                            )
+                            .map(clone)
+                        : [];
+
+                record.seenOps =
+                    Array.isArray(
+                        parsed.seenOps,
+                    )
+                        ? parsed.seenOps
+                            .slice(
+                                -MAX_SEEN_OPS,
+                            )
+                        : [];
+
+                record.generation =
+                    parsed.generation
+                        ? clone(
+                            parsed.generation,
+                        )
+                        : null;
+
+                /*
+                 * Never restore generation ownership from a previous runtime.
+                 * Server epoch changed, therefore prior ownership is fenced out.
+                 */
+                if (
+                    record.generation
+                ) {
+                    record.generation.state =
+                        'abandoned';
+
+                    record.generation.leaseUntil =
+                        0;
+                }
+
+                record.serverEpoch =
+                    runtimeEpoch;
+            } catch (error) {
+                console.warn(
+                    `[${PLUGIN_ID}] ignoring unreadable persisted scope ${fileName}`,
+                    error?.message ||
+                        error,
+                );
+            }
+        }
+    } catch (error) {
+        console.warn(
+            `[${PLUGIN_ID}] persistent state unavailable; running memory-only`,
+            error?.message ||
+                error,
+        );
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Membership                                                                   */
+/* -------------------------------------------------------------------------- */
+
+function requireMember(
+    record,
+    clientId,
+) {
+    const member =
+        record.members.get(
+            clientId,
+        );
+
+    if (!member) {
+        const error =
+            new Error(
+                'Client is not a member of this sync scope',
+            );
+
+        error.code =
+            'not_member';
+
+        throw error;
+    }
+
+    if (
+        member.expiresAt <=
+        now()
+    ) {
+        record.members.delete(
+            clientId,
+        );
+
+        const error =
+            new Error(
+                'Client membership expired',
+            );
+
+        error.code =
+            'membership_expired';
+
+        throw error;
+    }
+
+    member.lastSeen =
+        now();
+
+    member.expiresAt =
+        now() +
+        MEMBER_TTL_MS;
+
+    return member;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Generation expiry                                                            */
+/* -------------------------------------------------------------------------- */
+
+function expireGeneration(
+    record,
+) {
+    const generation =
+        record.generation;
+
+    if (!generation) {
+        return null;
+    }
+
+    if (
+        generation.leaseUntil >
+        now()
+    ) {
+        return null;
+    }
+
+    generation.state =
+        'abandoned';
+
+    /*
+     * Increment revision before making the event so the event advertises the
+     * authoritative new revision.
+     */
+    record.revision += 1;
+
+    const event =
+        makeEvent(
+            record,
+            {
+                type:
+                    'generation_abandoned',
+
+                sourceClientId:
+                    generation.ownerClientId,
+
+                sourceDeviceId:
+                    generation.ownerDeviceId,
+
+                payload: {
+                    reason:
+                        'lease_expired',
+
+                    generationId:
+                        generation.id,
+                },
+
+                generation:
+                    generation,
+            },
+        );
+
+    event.revision =
+        record.revision;
+
+    record.generation =
+        null;
+
+    broadcast(
+        record,
+        event,
+    );
+
+    void schedulePersist(
+        record,
+        true,
+    );
+
+    return event;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Request parsing                                                              */
+/* -------------------------------------------------------------------------- */
+
+function scopeFromRequest(
+    req,
+) {
+    let raw =
+        req.body?.scope;
+
+    if (
+        !raw &&
+        req.query?.scope
+    ) {
+        try {
+            raw =
+                JSON.parse(
+                    String(
+                        req.query.scope,
+                    ),
+                );
+        } catch {
+            raw =
+                null;
+        }
+    }
+
+    return normalizeScope(
+        raw,
+    );
+}
+
+function clientEnvelope(
+    req,
+) {
+    const body =
+        req.body || {};
+
+    const clientId =
+        validateId(
+            body.clientId,
+            'clientId',
+            256,
+        );
+
+    const deviceId =
+        validateId(
+            body.deviceId,
+            'deviceId',
+            256,
+        );
+
+    const protocolVersion =
+        Number(
+            body.protocolVersion,
+        );
+
+    if (
+        protocolVersion !==
+        PROTOCOL_VERSION
+    ) {
+        const error =
+            new Error(
+                `Protocol version ${protocolVersion} is not supported; expected ${PROTOCOL_VERSION}`,
+            );
+
+        error.code =
+            'protocol_mismatch';
+
+        throw error;
+    }
+
+    return {
+        clientId,
+        deviceId,
+        body,
+    };
+}
+
+function checkBaseRevision(
+    record,
+    body,
+) {
+    const baseRevision =
+        Number(
+            body.baseRevision,
+        );
+
+    if (
+        !Number.isSafeInteger(
+            baseRevision,
+        ) ||
+        baseRevision < 0
+    ) {
+        const error =
+            new Error(
+                'Invalid baseRevision',
+            );
+
+        error.code =
+            'invalid_revision';
+
+        throw error;
+    }
+
+    if (
+        baseRevision !==
+        record.revision
+    ) {
+        const error =
+            new Error(
+                'Client revision is stale',
+            );
+
+        error.code =
+            'stale_revision';
+
+        error.currentState =
+            publicState(
+                record,
+            );
+
+        throw error;
+    }
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Plugin init                                                                  */
+/* -------------------------------------------------------------------------- */
+
+async function init(
+    router,
+) {
+    /*
+     * Route-level body size guard.
+     *
+     * ST generally parses API bodies globally, so the actual snapshot/event
+     * is also size-validated below.
+     */
+    router.use(
+        (
+            req,
+            res,
+            next,
+        ) => {
+            const length =
+                Number(
+                    req.headers[
+                        'content-length'
+                    ],
+                );
+
+            if (
+                Number.isFinite(length) &&
+                length >
+                    MAX_EVENT_BYTES
+            ) {
+                return httpError(
+                    res,
+                    413,
+                    'payload_too_large',
+                    'Request body exceeds sync limit',
+                );
+            }
+
+            noStore(res);
+
+            return next();
+        },
+    );
+
+    await loadPersisted();
+
+
+    /* ---------------------------------------------------------------------- */
+    /* Health                                                                  */
+    /* ---------------------------------------------------------------------- */
 
     router.get(
         '/health',
-        (req, res) => {
-            res.json({
-                success: true,
-                plugin:
-                    PLUGIN_ID,
-                serverInstanceId,
-                groups:
-                    groups.size,
-                uptime:
-                    process.uptime(),
-            });
+        async (
+            req,
+            res,
+        ) => {
+            const members =
+                [...scopes.values()]
+                    .reduce(
+                        (
+                            sum,
+                            record,
+                        ) =>
+                            sum +
+                            record.members.size,
+                        0,
+                    );
+
+            const activeGenerations =
+                [...scopes.values()]
+                    .filter(
+                        record =>
+                            record.generation &&
+                            record.generation.leaseUntil >
+                                now(),
+                    )
+                    .length;
+
+            return ok(
+                res,
+                {
+                    plugin:
+                        PLUGIN_ID,
+
+                    protocolVersion:
+                        PROTOCOL_VERSION,
+
+                    epoch:
+                        runtimeEpoch,
+
+                    scopes:
+                        scopes.size,
+
+                    members,
+
+                    activeGenerations,
+                },
+            );
         },
     );
 
-    // -------------------------------------------------------
-    // Join
-    // -------------------------------------------------------
+
+    /* ---------------------------------------------------------------------- */
+    /* Join                                                                    */
+    /* ---------------------------------------------------------------------- */
 
     router.post(
         '/join',
-        (req, res) => {
-            const auth =
-                requireAuthenticatedUser(
-                    req,
-                    res,
-                );
-
-            if (!auth) {
-                return;
-            }
-
-            const validation =
-                validateJoinBody(
-                    req.body,
-                );
-
-            if (!validation.ok) {
-                return res
-                    .status(400)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            validation.error,
-                    });
-            }
-
-            const {
-                clientId,
-                deviceId,
-                chatKey,
-                lastSequence,
-            } = validation;
-
+        async (
+            req,
+            res,
+        ) => {
             try {
-                const group =
-                    getOrCreateGroup(
-                        auth.handle,
-                        chatKey,
+                const userId =
+                    userIdFromRequest(
+                        req,
                     );
 
-                /*
-                 * A reload/rejoin using the
-                 * same client ID replaces its
-                 * previous membership heartbeat.
-                 */
-                let member =
-                    group.clients.get(
+                const scope =
+                    normalizeScope(
+                        req.body?.scope,
+                    );
+
+                const {
+                    clientId,
+                    deviceId,
+                } =
+                    clientEnvelope(
+                        req,
+                    );
+
+                const key =
+                    scopeKey(
+                        userId,
+                        scope,
+                    );
+
+                const record =
+                    ensureScopeRecord(
+                        key,
+                        userId,
+                        scope,
+                    );
+
+                expireGeneration(
+                    record,
+                );
+
+                const existing =
+                    record.members.get(
                         clientId,
                     );
 
-                if (!member) {
-                    member = {
-                        clientId,
-                        deviceId,
-                        userHandle:
-                            auth.handle,
-                        joinedAt:
-                            Date.now(),
-                        lastHeartbeat:
-                            Date.now(),
-                        response:
-                            null,
-                    };
-
-                    group.clients.set(
-                        clientId,
-                        member,
+                if (
+                    !existing &&
+                    record.members.size >=
+                        MAX_MEMBERS_PER_SCOPE
+                ) {
+                    return httpError(
+                        res,
+                        429,
+                        'scope_client_limit',
+                        'Too many clients in this sync scope',
                     );
-                } else {
-                    member.deviceId =
-                        deviceId;
-
-                    member.lastHeartbeat =
-                        Date.now();
                 }
 
-                group.lastActivityAt =
-                    Date.now();
-
-                const replay =
-                    buildJoinReplay(
-                        group,
-                        lastSequence,
-                    );
-
-                res.json({
-                    success:
-                        true,
-
-                    chatKey:
-                        group.chatKey,
-
-                    nextSequence:
-                        group.sequence +
-                        1,
-
-                    serverInstanceId,
-
-                    clientCount:
-                        group.clients.size,
-
-                    missedEvents:
-                        replay.missedEvents,
-
-                    recoveryRequired:
-                        replay.recoveryRequired,
-
-                    state: {
-                        generation:
-                            serializeGeneration(
-                                group.generation,
-                            ),
-                    },
-                });
-
-                log(
-                    'client joined',
+                record.members.set(
+                    clientId,
                     {
                         clientId,
-                        user:
-                            auth.handle,
-                        chatKey,
-                        lastSequence,
-                        serverSequence:
-                            group.sequence,
-                        recoveryRequired:
-                            replay.recoveryRequired,
+                        deviceId,
+
+                        joinedAt:
+                            existing?.joinedAt ??
+                            now(),
+
+                        lastSeen:
+                            now(),
+
+                        expiresAt:
+                            now() +
+                            MEMBER_TTL_MS,
                     },
                 );
-            } catch (e) {
-                error(
-                    'join failed',
-                    e,
+
+                schedulePersist(
+                    record,
                 );
 
-                res.status(
-                    503,
-                ).json({
-                    success:
-                        false,
-                    error:
-                        e.message ||
-                        'Unable to join synchronization group',
-                });
-            }
-        },
-    );
-
-    // -------------------------------------------------------
-    // SSE Events
-    // -------------------------------------------------------
-
-    router.get(
-        '/events',
-        (req, res) => {
-            const auth =
-                requireAuthenticatedUser(
-                    req,
+                return ok(
                     res,
-                );
+                    {
+                        scope:
+                            clone(
+                                scope,
+                            ),
 
-            if (!auth) {
-                return;
-            }
+                        state:
+                            publicState(
+                                record,
+                            ),
 
-            const clientId =
-                validateClientId(
-                    req.query.clientId,
-                );
-
-            const chatKey =
-                validateChatKey(
-                    req.query.chatKey,
-                );
-
-            if (
-                !clientId ||
-                !chatKey
-            ) {
-                return res
-                    .status(400)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'clientId and chatKey are required',
-                    });
-            }
-
-            const group =
-                getGroupForUser(
-                    auth.handle,
-                    chatKey,
-                );
-
-            if (!group) {
-                return res
-                    .status(404)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'Synchronization group not found',
-                    });
-            }
-
-            const member =
-                group.clients.get(
-                    clientId,
-                );
-
-            if (!member) {
-                return res
-                    .status(403)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'Client is not a member of this synchronization group',
-                    });
-            }
-
-            touchClient(
-                group,
-                clientId,
-            );
-
-            attachSse(
-                group,
-                member,
-                req,
-                res,
-            );
-        },
-    );
-
-    // -------------------------------------------------------
-    // State
-    // -------------------------------------------------------
-
-    router.get(
-        '/state',
-        (req, res) => {
-            const auth =
-                requireAuthenticatedUser(
-                    req,
-                    res,
-                );
-
-            if (!auth) {
-                return;
-            }
-
-            const chatKey =
-                validateChatKey(
-                    req.query.chatKey,
-                );
-
-            if (!chatKey) {
-                return res
-                    .status(400)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'chatKey is required',
-                    });
-            }
-
-            const group =
-                getGroupForUser(
-                    auth.handle,
-                    chatKey,
-                );
-
-            if (!group) {
-                return res.json({
-                    success:
-                        true,
-                    chatKey,
-                    sequence:
-                        0,
-                    clientCount:
-                        0,
-                    generation:
-                        null,
-                    eventsAvailable:
-                        false,
-                });
-            }
-
-            res.json({
-                success:
-                    true,
-
-                chatKey:
-                    group.chatKey,
-
-                sequence:
-                    group.sequence,
-
-                oldestSequence:
-                    group.oldestSequence,
-
-                clientCount:
-                    group.clients.size,
-
-                generation:
-                    serializeGeneration(
-                        group.generation,
-                    ),
-
-                eventsAvailable:
-                    group.events.length >
-                    0,
-
-                serverInstanceId,
-            });
-        },
-    );
-
-    // -------------------------------------------------------
-    // Event
-    // -------------------------------------------------------
-
-    router.post(
-        '/event',
-        (req, res) => {
-            const auth =
-                requireAuthenticatedUser(
-                    req,
-                    res,
-                );
-
-            if (!auth) {
-                return;
-            }
-
-            const validation =
-                validateEventBody(
-                    req.body,
-                );
-
-            if (!validation.ok) {
-                return res
-                    .status(400)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            validation.error,
-                    });
-            }
-
-            const {
-                clientId,
-                deviceId,
-                chatKey,
-                event,
-            } = validation;
-
-            const group =
-                getGroupForUser(
-                    auth.handle,
-                    chatKey,
-                );
-
-            if (!group) {
-                return res
-                    .status(403)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'Client is not a member of this synchronization group',
-                    });
-            }
-
-            const member =
-                group.clients.get(
-                    clientId,
-                );
-
-            if (!member) {
-                return res
-                    .status(403)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'Client is not a member of this synchronization group',
-                    });
-            }
-
-            /*
-             * Client identity is authenticated
-             * through the SillyTavern session,
-             * while clientId/deviceId are only
-             * identifiers inside that session.
-             */
-            touchClient(
-                group,
-                clientId,
-                {
-                    deviceId,
-                },
-            );
-
-            if (
-                event.clientId &&
-                event.clientId !==
-                    clientId
-            ) {
-                return res
-                    .status(400)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'event.clientId does not match request clientId',
-                    });
-            }
-
-            if (
-                event.chatKey &&
-                event.chatKey !==
-                    chatKey
-            ) {
-                return res
-                    .status(400)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'event.chatKey does not match request chatKey',
-                    });
-            }
-
-            event.clientId =
-                clientId;
-
-            event.deviceId =
-                deviceId;
-
-            event.chatKey =
-                chatKey;
-
-            event.userId =
-                auth.handle;
-
-            try {
-                const result =
-                    handleEvent(
-                        group,
-                        event,
-                        {
+                        member: {
                             clientId,
                             deviceId,
                         },
-                    );
-
-                if (!result.ok) {
-                    return res
-                        .status(
-                            result.status ||
-                                400,
-                        )
-                        .json({
-                            success:
-                                false,
-                            error:
-                                result.error,
-                            generation:
-                                serializeGeneration(
-                                    group.generation,
-                                ),
-                            sequence:
-                                group.sequence,
-                        });
-                }
-
-                return res.json({
-                    success:
-                        true,
-
-                    duplicate:
-                        Boolean(
-                            result.duplicate,
-                        ),
-
-                    event:
-                        result.event
-                            ? safeClone(
-                                result.event,
-                            )
-                            : undefined,
-
-                    sequence:
-                        result.event
-                            ?.sequence ??
-                        group.sequence,
-
-                    generation:
-                        serializeGeneration(
-                            group.generation,
-                        ),
-                });
-            } catch (e) {
-                error(
-                    'event handling failed',
-                    e,
+                    },
                 );
-
-                return res
-                    .status(500)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'Internal synchronization error',
-                    });
-            }
-        },
-    );
-
-    // -------------------------------------------------------
-    // Heartbeat
-    // -------------------------------------------------------
-
-    router.post(
-        '/heartbeat',
-        (req, res) => {
-            const auth =
-                requireAuthenticatedUser(
-                    req,
+            } catch (error) {
+                return httpError(
                     res,
-                );
+                    error.code ===
+                        'protocol_mismatch'
+                        ? 426
+                        : 400,
 
-            if (!auth) {
-                return;
+                    error.code ||
+                        'invalid_request',
+
+                    error.message,
+                );
             }
-
-            const clientId =
-                validateClientId(
-                    req.body?.clientId,
-                );
-
-            const chatKey =
-                validateChatKey(
-                    req.body?.chatKey,
-                );
-
-            if (
-                !clientId ||
-                !chatKey
-            ) {
-                return res
-                    .status(400)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'clientId and chatKey are required',
-                    });
-            }
-
-            const group =
-                getGroupForUser(
-                    auth.handle,
-                    chatKey,
-                );
-
-            if (!group) {
-                return res
-                    .status(404)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'Synchronization group not found',
-                    });
-            }
-
-            const member =
-                group.clients.get(
-                    clientId,
-                );
-
-            if (!member) {
-                return res
-                    .status(403)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'Client is not a member of this synchronization group',
-                    });
-            }
-
-            touchClient(
-                group,
-                clientId,
-            );
-
-            res.json({
-                success:
-                    true,
-
-                sequence:
-                    group.sequence,
-
-                generation:
-                    serializeGeneration(
-                        group.generation,
-                    ),
-            });
         },
     );
 
-    // -------------------------------------------------------
-    // Leave
-    // -------------------------------------------------------
+
+    /* ---------------------------------------------------------------------- */
+    /* Leave                                                                   */
+    /* ---------------------------------------------------------------------- */
 
     router.post(
         '/leave',
-        (req, res) => {
-            const auth =
-                requireAuthenticatedUser(
-                    req,
+        async (
+            req,
+            res,
+        ) => {
+            try {
+                const userId =
+                    userIdFromRequest(
+                        req,
+                    );
+
+                const scope =
+                    normalizeScope(
+                        req.body?.scope,
+                    );
+
+                const {
+                    clientId,
+                } =
+                    clientEnvelope(
+                        req,
+                    );
+
+                const key =
+                    scopeKey(
+                        userId,
+                        scope,
+                    );
+
+                const record =
+                    scopes.get(
+                        key,
+                    );
+
+                if (!record) {
+                    return ok(
+                        res,
+                        {
+                            left:
+                                false,
+                        },
+                    );
+                }
+
+                record.members.delete(
+                    clientId,
+                );
+
+                if (
+                    record.generation?.ownerClientId ===
+                    clientId
+                ) {
+                    record.generation = {
+                        ...record.generation,
+
+                        state:
+                            'abandoned',
+
+                        leaseUntil:
+                            0,
+                    };
+
+                    const oldGeneration =
+                        record.generation;
+
+                    record.revision += 1;
+
+                    const event =
+                        makeEvent(
+                            record,
+                            {
+                                type:
+                                    'generation_abandoned',
+
+                                sourceClientId:
+                                    clientId,
+
+                                payload: {
+                                    reason:
+                                        'owner_left',
+
+                                    generationId:
+                                        oldGeneration.id,
+                                },
+
+                                generation:
+                                    oldGeneration,
+                            },
+                        );
+
+                    event.revision =
+                        record.revision;
+
+                    record.generation =
+                        null;
+
+                    broadcast(
+                        record,
+                        event,
+                    );
+                }
+
+                await schedulePersist(
+                    record,
+                    true,
+                );
+
+                return ok(
+                    res,
+                    {
+                        left:
+                            true,
+                    },
+                );
+            } catch (error) {
+                return httpError(
+                    res,
+                    400,
+
+                    error.code ||
+                        'invalid_request',
+
+                    error.message,
+                );
+            }
+        },
+    );
+
+
+    /* ---------------------------------------------------------------------- */
+    /* Heartbeat                                                               */
+    /* ---------------------------------------------------------------------- */
+
+    router.post(
+        '/heartbeat',
+        async (
+            req,
+            res,
+        ) => {
+            try {
+                const userId =
+                    userIdFromRequest(
+                        req,
+                    );
+
+                const scope =
+                    normalizeScope(
+                        req.body?.scope,
+                    );
+
+                const {
+                    clientId,
+                    deviceId,
+                } =
+                    clientEnvelope(
+                        req,
+                    );
+
+                const key =
+                    scopeKey(
+                        userId,
+                        scope,
+                    );
+
+                const record =
+                    scopes.get(
+                        key,
+                    );
+
+                if (!record) {
+                    return httpError(
+                        res,
+                        404,
+                        'scope_not_found',
+                        'Sync scope does not exist yet',
+                    );
+                }
+
+                const member =
+                    requireMember(
+                        record,
+                        clientId,
+                    );
+
+                if (
+                    member.deviceId !==
+                    deviceId
+                ) {
+                    return httpError(
+                        res,
+                        409,
+                        'device_mismatch',
+                        'Client identity changed for this membership',
+                    );
+                }
+
+                expireGeneration(
+                    record,
+                );
+
+                if (
+                    record.generation &&
+                    record.generation.ownerClientId ===
+                        clientId
+                ) {
+                    const generationId =
+                        String(
+                            req.body?.generationId ||
+                                '',
+                        );
+
+                    if (
+                        generationId ===
+                        record.generation.id
+                    ) {
+                        record.generation.leaseUntil =
+                            now() +
+                            GENERATION_LEASE_MS;
+                    }
+                }
+
+                return ok(
+                    res,
+                    {
+                        serverTime:
+                            now(),
+
+                        state:
+                            publicState(
+                                record,
+                            ),
+                    },
+                );
+            } catch (error) {
+                return httpError(
+                    res,
+                    error.code ===
+                        'not_member' ||
+                    error.code ===
+                        'membership_expired'
+                        ? 403
+                        : 400,
+
+                    error.code ||
+                        'invalid_request',
+
+                    error.message,
+                );
+            }
+        },
+    );
+
+
+    /* ---------------------------------------------------------------------- */
+    /* SSE                                                                     */
+    /* ---------------------------------------------------------------------- */
+
+    router.get(
+        '/events',
+        async (
+            req,
+            res,
+        ) => {
+            let record;
+            let keepaliveTimer;
+
+            try {
+                const userId =
+                    userIdFromRequest(
+                        req,
+                    );
+
+                const scope =
+                    scopeFromRequest(
+                        req,
+                    );
+
+                const clientId =
+                    validateId(
+                        req.query.clientId,
+                        'clientId',
+                        256,
+                    );
+
+                const deviceId =
+                    validateId(
+                        req.query.deviceId,
+                        'deviceId',
+                        256,
+                    );
+
+                const key =
+                    scopeKey(
+                        userId,
+                        scope,
+                    );
+
+                record =
+                    scopes.get(
+                        key,
+                    );
+
+                if (!record) {
+                    return httpError(
+                        res,
+                        404,
+                        'scope_not_found',
+                        'Join the scope before opening SSE',
+                    );
+                }
+
+                const member =
+                    requireMember(
+                        record,
+                        clientId,
+                    );
+
+                if (
+                    member.deviceId !==
+                    deviceId
+                ) {
+                    return httpError(
+                        res,
+                        409,
+                        'device_mismatch',
+                        'Client identity changed for this membership',
+                    );
+                }
+
+                expireGeneration(
+                    record,
+                );
+
+                const cursor =
+                    parseEventCursor(
+                        req.get(
+                            'Last-Event-ID',
+                        ) ||
+                        req.query.since ||
+                        '',
+                    );
+
+                res.status(200);
+
+                res.setHeader(
+                    'Content-Type',
+                    'text/event-stream; charset=utf-8',
+                );
+
+                res.setHeader(
+                    'Cache-Control',
+                    'no-cache, no-transform',
+                );
+
+                res.setHeader(
+                    'Connection',
+                    'keep-alive',
+                );
+
+                res.setHeader(
+                    'X-Accel-Buffering',
+                    'no',
+                );
+
+                if (
+                    typeof res.flushHeaders ===
+                    'function'
+                ) {
+                    res.flushHeaders();
+                }
+
+                let clients =
+                    sseByScope.get(
+                        key,
+                    );
+
+                if (!clients) {
+                    clients =
+                        new Set();
+
+                    sseByScope.set(
+                        key,
+                        clients,
+                    );
+                }
+
+                clients.add(
                     res,
                 );
 
-            if (!auth) {
-                return;
-            }
+                sendSse(
+                    res,
+                    'hello',
+                    {
+                        protocolVersion:
+                            PROTOCOL_VERSION,
 
-            const clientId =
-                validateClientId(
-                    req.body?.clientId,
+                        epoch:
+                            runtimeEpoch,
+
+                        revision:
+                            record.revision,
+
+                        seq:
+                            record.seq,
+
+                        snapshotHash:
+                            record.snapshotHash,
+
+                        generation:
+                            record.generation
+                                ? compactGeneration(
+                                    record.generation,
+                                )
+                                : null,
+                    },
                 );
 
-            const chatKey =
-                validateChatKey(
-                    req.body?.chatKey,
-                );
-
-            if (
-                !clientId ||
-                !chatKey
-            ) {
-                return res
-                    .status(400)
-                    .json({
-                        success:
-                            false,
-                        error:
-                            'clientId and chatKey are required',
-                    });
-            }
-
-            const group =
-                getGroupForUser(
-                    auth.handle,
-                    chatKey,
-                );
-
-            if (!group) {
-                return res.json({
-                    success:
-                        true,
-                    alreadyAbsent:
-                        true,
-                });
-            }
-
-            const member =
-                group.clients.get(
-                    clientId,
-                );
-
-            if (!member) {
-                return res.json({
-                    success:
-                        true,
-                    alreadyAbsent:
-                        true,
-                });
-            }
-
-            /*
-             * If this client owns the
-             * active generation, terminate it
-             * before removing the membership.
-             *
-             * This is also the crash-safety fallback:
-             * if the explicit owner-release event
-             * was lost, leave() still cleans it up.
-             */
-            if (
-                group.generation &&
-                group.generation.ownerId ===
-                    clientId
-            ) {
-                terminateOrphanedGeneration(
-                    group,
-                    'owner_left',
-                );
-            }
-
-            removeClient(
-                group,
-                clientId,
-            );
-
-            res.json({
-                success:
-                    true,
-
-                clientCount:
-                    group.clients.size,
-
-                sequence:
-                    group.sequence,
-            });
-
-            log(
-                'client left',
-                {
-                    clientId,
-                    user:
-                        auth.handle,
-                    chatKey,
-                },
-            );
-        },
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Init / Exit
-// ---------------------------------------------------------------------------
-
-async function init(router) {
-    registerRoutes(
-        router,
-    );
-
-    cleanupTimer =
-        setInterval(
-            cleanupGroups,
-            CLEANUP_INTERVAL_MS,
-        );
-
-    keepaliveTimer =
-        setInterval(
-            () => {
-                cleanupStaleClients();
-
-                for (
-                    const group of
-                    groups.values()
-                ) {
+                if (cursor) {
                     if (
-                        group.clients.size >
-                        0
+                        cursor.epoch !==
+                        runtimeEpoch
                     ) {
-                        broadcastComment(
-                            group,
+                        sendSse(
+                            res,
+                            'resync_required',
+                            {
+                                reason:
+                                    'server_epoch_changed',
+
+                                epoch:
+                                    runtimeEpoch,
+
+                                revision:
+                                    record.revision,
+
+                                seq:
+                                    record.seq,
+                            },
                         );
+                    } else {
+                        const oldest =
+                            record.events.length
+                                ? record.events[0].seq
+                                : record.seq + 1;
+
+                        if (
+                            cursor.seq <
+                            oldest - 1
+                        ) {
+                            sendSse(
+                                res,
+                                'resync_required',
+                                {
+                                    reason:
+                                        'replay_window_exceeded',
+
+                                    epoch:
+                                        runtimeEpoch,
+
+                                    revision:
+                                        record.revision,
+
+                                    seq:
+                                        record.seq,
+                                },
+                            );
+                        } else {
+                            for (
+                                const event of
+                                    record.events
+                            ) {
+                                if (
+                                    event.epoch !==
+                                    runtimeEpoch
+                                ) {
+                                    continue;
+                                }
+
+                                if (
+                                    event.seq <=
+                                    cursor.seq
+                                ) {
+                                    continue;
+                                }
+
+                                /*
+                                 * Stream events cannot reconstruct an exact
+                                 * stream state from replay alone. Pull /state.
+                                 */
+                                if (
+                                    event.type ===
+                                    'generation_stream'
+                                ) {
+                                    sendSse(
+                                        res,
+                                        'resync_required',
+                                        {
+                                            reason:
+                                                'stream_replay_requires_state',
+
+                                            epoch:
+                                                runtimeEpoch,
+
+                                            revision:
+                                                record.revision,
+
+                                            seq:
+                                                record.seq,
+                                        },
+                                    );
+
+                                    break;
+                                }
+
+                                sendSse(
+                                    res,
+                                    'sync',
+                                    {
+                                        ...clone(
+                                            event,
+                                        ),
+
+                                        state: {
+                                            epoch:
+                                                runtimeEpoch,
+
+                                            revision:
+                                                record.revision,
+
+                                            seq:
+                                                record.seq,
+
+                                            snapshotHash:
+                                                record.snapshotHash,
+
+                                            generation:
+                                                record.generation
+                                                    ? compactGeneration(
+                                                        record.generation,
+                                                    )
+                                                    : null,
+                                        },
+
+                                        snapshot:
+                                            event.snapshot ??
+                                            (
+                                                record.snapshot
+                                                    ? clone(
+                                                        record.snapshot,
+                                                    )
+                                                    : null
+                                            ),
+                                    },
+                                    event.id,
+                                );
+                            }
+                        }
                     }
                 }
-            },
-            SSE_KEEPALIVE_INTERVAL_MS,
-        );
 
-    log(
-        'Multi-Client Sync server plugin loaded',
-        {
-            serverInstanceId,
-            maxEventsPerGroup:
-                MAX_EVENTS_PER_GROUP,
-            clientTtlMs:
-                CLIENT_TTL_MS,
+                keepaliveTimer =
+                    setInterval(
+                        () => {
+                            try {
+                                if (
+                                    res.writableEnded
+                                ) {
+                                    return;
+                                }
+
+                                res.write(
+                                    `: keepalive ${now()}\n\n`,
+                                );
+
+                                member.lastSeen =
+                                    now();
+
+                                member.expiresAt =
+                                    now() +
+                                    MEMBER_TTL_MS;
+
+                                if (
+                                    record.generation?.ownerClientId ===
+                                    clientId
+                                ) {
+                                    record.generation.leaseUntil =
+                                        now() +
+                                        GENERATION_LEASE_MS;
+                                }
+                            } catch {
+                                try {
+                                    res.end();
+                                } catch {
+                                    // ignored
+                                }
+                            }
+                        },
+                        KEEPALIVE_MS,
+                    );
+
+                const cleanup =
+                    () => {
+                        if (
+                            keepaliveTimer
+                        ) {
+                            clearInterval(
+                                keepaliveTimer,
+                            );
+                        }
+
+                        const set =
+                            sseByScope.get(
+                                key,
+                            );
+
+                        if (set) {
+                            set.delete(
+                                res,
+                            );
+
+                            if (
+                                set.size ===
+                                0
+                            ) {
+                                sseByScope.delete(
+                                    key,
+                                );
+                            }
+                        }
+                    };
+
+                req.on(
+                    'close',
+                    cleanup,
+                );
+
+                res.on(
+                    'close',
+                    cleanup,
+                );
+            } catch (error) {
+                return httpError(
+                    res,
+                    error.code ===
+                        'not_member' ||
+                    error.code ===
+                        'membership_expired'
+                        ? 403
+                        : 400,
+
+                    error.code ||
+                        'invalid_request',
+
+                    error.message,
+                );
+            }
         },
     );
-}
 
-async function exit() {
-    if (cleanupTimer) {
-        clearInterval(
-            cleanupTimer,
+
+    /* ---------------------------------------------------------------------- */
+    /* State                                                                    */
+    /* ---------------------------------------------------------------------- */
+
+    router.get(
+        '/state',
+        async (
+            req,
+            res,
+        ) => {
+            try {
+                const userId =
+                    userIdFromRequest(
+                        req,
+                    );
+
+                const scope =
+                    scopeFromRequest(
+                        req,
+                    );
+
+                const clientId =
+                    validateId(
+                        req.query.clientId,
+                        'clientId',
+                        256,
+                    );
+
+                const key =
+                    scopeKey(
+                        userId,
+                        scope,
+                    );
+
+                const record =
+                    scopes.get(
+                        key,
+                    );
+
+                if (!record) {
+                    return httpError(
+                        res,
+                        404,
+                        'scope_not_found',
+                        'Sync scope does not exist yet',
+                    );
+                }
+
+                requireMember(
+                    record,
+                    clientId,
+                );
+
+                expireGeneration(
+                    record,
+                );
+
+                return ok(
+                    res,
+                    {
+                        scope:
+                            clone(scope),
+
+                        state:
+                            publicState(
+                                record,
+                            ),
+                    },
+                );
+            } catch (error) {
+                return httpError(
+                    res,
+                    error.code ===
+                        'not_member' ||
+                    error.code ===
+                        'membership_expired'
+                        ? 403
+                        : 400,
+
+                    error.code ||
+                        'invalid_request',
+
+                    error.message,
+                );
+            }
+        },
+    );
+
+
+    /* ---------------------------------------------------------------------- */
+    /* Event                                                                     */
+    /* ---------------------------------------------------------------------- */
+
+    router.post(
+        '/event',
+        async (
+            req,
+            res,
+        ) => {
+            try {
+                const userId =
+                    userIdFromRequest(
+                        req,
+                    );
+
+                const scope =
+                    normalizeScope(
+                        req.body?.scope,
+                    );
+
+                const {
+                    clientId,
+                    deviceId,
+                    body,
+                } =
+                    clientEnvelope(
+                        req,
+                    );
+
+                const key =
+                    scopeKey(
+                        userId,
+                        scope,
+                    );
+
+                const record =
+                    scopes.get(
+                        key,
+                    );
+
+                if (!record) {
+                    return httpError(
+                        res,
+                        404,
+                        'scope_not_found',
+                        'Join the sync scope first',
+                    );
+                }
+
+                const member =
+                    requireMember(
+                        record,
+                        clientId,
+                    );
+
+                if (
+                    member.deviceId !==
+                    deviceId
+                ) {
+                    return httpError(
+                        res,
+                        409,
+                        'device_mismatch',
+                        'Client identity changed for this membership',
+                    );
+                }
+
+                expireGeneration(
+                    record,
+                );
+
+                const opId =
+                    validateId(
+                        body.opId,
+                        'opId',
+                        256,
+                    );
+
+                const type =
+                    validateId(
+                        body.type,
+                        'type',
+                        128,
+                    );
+
+                const bytes =
+                    jsonBytes(
+                        body,
+                    );
+
+                if (
+                    bytes >
+                    MAX_EVENT_BYTES
+                ) {
+                    return httpError(
+                        res,
+                        413,
+                        'payload_too_large',
+                        'Event exceeds sync limit',
+                    );
+                }
+
+                /*
+                 * Idempotency.
+                 */
+                if (
+                    hasSeenOp(
+                        record,
+                        opId,
+                    )
+                ) {
+                    return ok(
+                        res,
+                        {
+                            duplicate:
+                                true,
+
+                            state:
+                                publicState(
+                                    record,
+                                ),
+                        },
+                    );
+                }
+
+
+                /* ---------------------------------------------------------- */
+                /* Generation claim                                            */
+                /* ---------------------------------------------------------- */
+
+                if (
+                    type ===
+                    'generation_claim'
+                ) {
+                    checkBaseRevision(
+                        record,
+                        body,
+                    );
+
+                    if (
+                        record.generation
+                    ) {
+                        return httpError(
+                            res,
+                            409,
+                            'generation_owned',
+                            'Another client already owns generation',
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    const generationId =
+                        validateId(
+                            body.generationId,
+                            'generationId',
+                            256,
+                        );
+
+                    const generation = {
+                        id:
+                            generationId,
+
+                        ownerClientId:
+                            clientId,
+
+                        ownerDeviceId:
+                            deviceId,
+
+                        state:
+                            'running',
+
+                        leaseUntil:
+                            now() +
+                            GENERATION_LEASE_MS,
+
+                        startedAt:
+                            now(),
+
+                        streamSeq:
+                            0,
+
+                        stopRequested:
+                            false,
+
+                        stopRequesterClientId:
+                            null,
+                    };
+
+                    record.generation =
+                        generation;
+
+                    record.revision += 1;
+
+                    rememberOp(
+                        record,
+                        opId,
+                    );
+
+                    const event =
+                        makeEvent(
+                            record,
+                            {
+                                type:
+                                    'generation_claimed',
+
+                                opId,
+
+                                sourceClientId:
+                                    clientId,
+
+                                sourceDeviceId:
+                                    deviceId,
+
+                                payload: {
+                                    generationId,
+                                },
+
+                                generation,
+                            },
+                        );
+
+                    event.revision =
+                        record.revision;
+
+                    broadcast(
+                        record,
+                        event,
+                    );
+
+                    await schedulePersist(
+                        record,
+                        true,
+                    );
+
+                    return ok(
+                        res,
+                        {
+                            accepted:
+                                true,
+
+                            event,
+
+                            state:
+                                publicState(
+                                    record,
+                                ),
+                        },
+                    );
+                }
+
+
+                /* ---------------------------------------------------------- */
+                /* Generation stop request                                     */
+                /* ---------------------------------------------------------- */
+
+                if (
+                    type ===
+                    'generation_stop_request'
+                ) {
+                    checkBaseRevision(
+                        record,
+                        body,
+                    );
+
+                    if (
+                        !record.generation
+                    ) {
+                        return ok(
+                            res,
+                            {
+                                accepted:
+                                    false,
+
+                                reason:
+                                    'no_active_generation',
+
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    const generationId =
+                        validateId(
+                            body.generationId,
+                            'generationId',
+                            256,
+                        );
+
+                    if (
+                        generationId !==
+                        record.generation.id
+                    ) {
+                        return httpError(
+                            res,
+                            409,
+                            'generation_stale',
+                            'Generation ID is no longer active',
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    record.stopRequestIds.add(
+                        opId,
+                    );
+
+                    if (
+                        record.stopRequestIds.size >
+                        MAX_SEEN_OPS
+                    ) {
+                        record.stopRequestIds =
+                            new Set(
+                                [
+                                    ...record.stopRequestIds,
+                                ].slice(
+                                    -MAX_SEEN_OPS,
+                                ),
+                            );
+                    }
+
+                    record.generation.stopRequested =
+                        true;
+
+                    record.generation.stopRequesterClientId =
+                        clientId;
+
+                    record.generation.leaseUntil =
+                        now() +
+                        GENERATION_LEASE_MS;
+
+                    record.revision += 1;
+
+                    rememberOp(
+                        record,
+                        opId,
+                    );
+
+                    const event =
+                        makeEvent(
+                            record,
+                            {
+                                type:
+                                    'generation_stop_requested',
+
+                                opId,
+
+                                sourceClientId:
+                                    clientId,
+
+                                sourceDeviceId:
+                                    deviceId,
+
+                                payload: {
+                                    generationId,
+
+                                    requesterClientId:
+                                        clientId,
+                                },
+
+                                generation:
+                                    record.generation,
+                            },
+                        );
+
+                    event.revision =
+                        record.revision;
+
+                    broadcast(
+                        record,
+                        event,
+                    );
+
+                    schedulePersist(
+                        record,
+                    );
+
+                    return ok(
+                        res,
+                        {
+                            accepted:
+                                true,
+
+                            event,
+
+                            state:
+                                publicState(
+                                    record,
+                                ),
+                        },
+                    );
+                }
+
+
+                /* ---------------------------------------------------------- */
+                /* Generation streaming                                        */
+                /* ---------------------------------------------------------- */
+
+                if (
+                    type ===
+                    'generation_stream'
+                ) {
+                    if (
+                        !record.generation
+                    ) {
+                        return httpError(
+                            res,
+                            409,
+                            'generation_stale',
+                            'No active generation',
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    if (
+                        record.generation.ownerClientId !==
+                        clientId
+                    ) {
+                        return httpError(
+                            res,
+                            409,
+                            'generation_not_owner',
+                            'Only the generation owner may publish stream state',
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    const generationId =
+                        validateId(
+                            body.generationId,
+                            'generationId',
+                            256,
+                        );
+
+                    if (
+                        generationId !==
+                        record.generation.id
+                    ) {
+                        return httpError(
+                            res,
+                            409,
+                            'generation_stale',
+                            'Generation ID is no longer active',
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    if (
+                        record.generation.leaseUntil <=
+                        now()
+                    ) {
+                        expireGeneration(
+                            record,
+                        );
+
+                        return httpError(
+                            res,
+                            409,
+                            'generation_expired',
+                            'Generation lease expired',
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    const streamSeq =
+                        Number(
+                            body.streamSeq,
+                        );
+
+                    if (
+                        !Number.isSafeInteger(
+                            streamSeq,
+                        ) ||
+                        streamSeq <=
+                            record.generation.streamSeq
+                    ) {
+                        return ok(
+                            res,
+                            {
+                                duplicate:
+                                    true,
+
+                                reason:
+                                    'stream_sequence',
+
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    /*
+                     * Streaming is still revision guarded. This prevents a
+                     * stream chunk from overwriting a newer accepted state.
+                     */
+                    checkBaseRevision(
+                        record,
+                        body,
+                    );
+
+                    validateSnapshot(
+                        body.snapshot,
+                    );
+
+                    record.snapshot =
+                        clone(
+                            body.snapshot,
+                        );
+
+                    record.snapshotHash =
+                        crypto
+                            .createHash(
+                                'sha256',
+                            )
+                            .update(
+                                stableStringify(
+                                    record.snapshot,
+                                ),
+                            )
+                            .digest(
+                                'hex',
+                            );
+
+                    record.generation.streamSeq =
+                        streamSeq;
+
+                    record.generation.leaseUntil =
+                        now() +
+                        GENERATION_LEASE_MS;
+
+                    record.revision += 1;
+
+                    rememberOp(
+                        record,
+                        opId,
+                    );
+
+                    const event =
+                        makeEvent(
+                            record,
+                            {
+                                type:
+                                    'generation_stream',
+
+                                opId,
+
+                                sourceClientId:
+                                    clientId,
+
+                                sourceDeviceId:
+                                    deviceId,
+
+                                payload: {
+                                    generationId,
+
+                                    streamSeq,
+                                },
+
+                                generation:
+                                    record.generation,
+
+                                includeSnapshot:
+                                    true,
+                            },
+                        );
+
+                    event.revision =
+                        record.revision;
+
+                    broadcast(
+                        record,
+                        event,
+                    );
+
+                    schedulePersist(
+                        record,
+                    );
+
+                    return ok(
+                        res,
+                        {
+                            accepted:
+                                true,
+
+                            event,
+
+                            state:
+                                publicState(
+                                    record,
+                                ),
+                        },
+                    );
+                }
+
+
+                /* ---------------------------------------------------------- */
+                /* Generation terminal                                         */
+                /* ---------------------------------------------------------- */
+
+                if (
+                    type ===
+                    'generation_terminal'
+                ) {
+                    if (
+                        !record.generation
+                    ) {
+                        return httpError(
+                            res,
+                            409,
+                            'generation_stale',
+                            'No active generation',
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    if (
+                        record.generation.ownerClientId !==
+                        clientId
+                    ) {
+                        return httpError(
+                            res,
+                            409,
+                            'generation_not_owner',
+                            'Only the generation owner may finish the generation',
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    const generationId =
+                        validateId(
+                            body.generationId,
+                            'generationId',
+                            256,
+                        );
+
+                    if (
+                        generationId !==
+                        record.generation.id
+                    ) {
+                        return httpError(
+                            res,
+                            409,
+                            'generation_stale',
+                            'Generation ID is no longer active',
+                            {
+                                state:
+                                    publicState(
+                                        record,
+                                    ),
+                            },
+                        );
+                    }
+
+                    const status =
+                        [
+                            'completed',
+                            'stopped',
+                            'failed',
+                            'abandoned',
+                        ].includes(
+                            body.status,
+                        )
+                            ? body.status
+                            : null;
+
+                    if (!status) {
+                        return httpError(
+                            res,
+                            400,
+                            'invalid_generation_status',
+                            'Invalid generation terminal state',
+                        );
+                    }
+
+                    checkBaseRevision(
+                        record,
+                        body,
+                    );
+
+                    validateSnapshot(
+                        body.snapshot,
+                    );
+
+                    record.snapshot =
+                        clone(
+                            body.snapshot,
+                        );
+
+                    record.snapshotHash =
+                        crypto
+                            .createHash(
+                                'sha256',
+                            )
+                            .update(
+                                stableStringify(
+                                    record.snapshot,
+                                ),
+                            )
+                            .digest(
+                                'hex',
+                            );
+
+                    record.generation.state =
+                        status;
+
+                    record.generation.leaseUntil =
+                        0;
+
+                    record.revision += 1;
+
+                    rememberOp(
+                        record,
+                        opId,
+                    );
+
+                    const oldGeneration =
+                        clone(
+                            record.generation,
+                        );
+
+                    const event =
+                        makeEvent(
+                            record,
+                            {
+                                type:
+                                    'generation_terminal',
+
+                                opId,
+
+                                sourceClientId:
+                                    clientId,
+
+                                sourceDeviceId:
+                                    deviceId,
+
+                                payload: {
+                                    generationId,
+
+                                    status,
+                                },
+
+                                generation:
+                                    oldGeneration,
+
+                                includeSnapshot:
+                                    true,
+                            },
+                        );
+
+                    event.revision =
+                        record.revision;
+
+                    record.generation =
+                        null;
+
+                    broadcast(
+                        record,
+                        event,
+                    );
+
+                    await schedulePersist(
+                        record,
+                        true,
+                    );
+
+                    return ok(
+                        res,
+                        {
+                            accepted:
+                                true,
+
+                            event,
+
+                            state:
+                                publicState(
+                                    record,
+                                ),
+                        },
+                    );
+                }
+
+
+                /* ---------------------------------------------------------- */
+                /* Ordinary state mutation                                     */
+                /* ---------------------------------------------------------- */
+
+                checkBaseRevision(
+                    record,
+                    body,
+                );
+
+                /*
+                 * Non-owner clients cannot mutate chat content while another
+                 * client is generating.
+                 */
+                if (
+                    record.generation &&
+                    record.generation.ownerClientId !==
+                        clientId
+                ) {
+                    return httpError(
+                        res,
+                        409,
+                        'generation_lock',
+                        'Chat mutations are locked while another client is generating',
+                        {
+                            state:
+                                publicState(
+                                    record,
+                                ),
+                        },
+                    );
+                }
+
+                const snapshot =
+                    body.snapshot;
+
+                validateSnapshot(
+                    snapshot,
+                );
+
+                record.snapshot =
+                    clone(
+                        snapshot,
+                    );
+
+                record.snapshotHash =
+                    crypto
+                        .createHash(
+                            'sha256',
+                        )
+                        .update(
+                            stableStringify(
+                                record.snapshot,
+                            ),
+                        )
+                        .digest(
+                            'hex',
+                        );
+
+                record.revision += 1;
+
+                rememberOp(
+                    record,
+                    opId,
+                );
+
+                const event =
+                    makeEvent(
+                        record,
+                        {
+                            type,
+
+                            opId,
+
+                            sourceClientId:
+                                clientId,
+
+                            sourceDeviceId:
+                                deviceId,
+
+                            payload:
+                                clone(
+                                    body.payload ||
+                                    {},
+                                ),
+
+                            generation:
+                                record.generation,
+
+                            includeSnapshot:
+                                true,
+                        },
+                    );
+
+                event.revision =
+                    record.revision;
+
+                broadcast(
+                    record,
+                    event,
+                );
+
+                await schedulePersist(
+                    record,
+                    true,
+                );
+
+                return ok(
+                    res,
+                    {
+                        accepted:
+                            true,
+
+                        event,
+
+                        state:
+                            publicState(
+                                record,
+                            ),
+                    },
+                );
+            } catch (error) {
+                if (
+                    error.currentState
+                ) {
+                    return httpError(
+                        res,
+                        409,
+
+                        error.code ||
+                            'conflict',
+
+                        error.message,
+
+                        {
+                            state:
+                                error.currentState,
+                        },
+                    );
+                }
+
+                const status =
+                    error.code ===
+                        'not_member' ||
+                    error.code ===
+                        'membership_expired'
+                        ? 403
+                        : error.code ===
+                            'protocol_mismatch'
+                            ? 426
+                            : error.code ===
+                                'snapshot_too_large' ||
+                              error.code ===
+                                'payload_too_large'
+                                ? 413
+                                : error.code ===
+                                    'device_mismatch'
+                                    ? 409
+                                    : 400;
+
+                return httpError(
+                    res,
+                    status,
+
+                    error.code ||
+                        'invalid_request',
+
+                    error.message,
+                );
+            }
+        },
+    );
+
+
+    /* ---------------------------------------------------------------------- */
+    /* Server watchdog                                                         */
+    /* ---------------------------------------------------------------------- */
+
+    scanTimer =
+        setInterval(
+            () => {
+                const timestamp =
+                    now();
+
+                for (
+                    const record of
+                        scopes.values()
+                ) {
+                    for (
+                        const [
+                            clientId,
+                            member,
+                        ] of record.members
+                    ) {
+                        if (
+                            member.expiresAt <=
+                            timestamp
+                        ) {
+                            record.members.delete(
+                                clientId,
+                            );
+                        }
+                    }
+
+                    expireGeneration(
+                        record,
+                    );
+                }
+            },
+            GENERATION_SCAN_MS,
         );
 
-        cleanupTimer =
-            null;
-    }
-
-    if (keepaliveTimer) {
-        clearInterval(
-            keepaliveTimer,
-        );
-
-        keepaliveTimer =
-            null;
-    }
-
-    for (
-        const group of
-        groups.values()
-    ) {
-        if (
-            group.generation
-        ) {
-            terminateOrphanedGeneration(
-                group,
-                'server_shutdown',
-            );
-        }
-
-        for (
-            const member of
-            group.clients.values()
-        ) {
-            closeSseConnection(
-                member,
-            );
-        }
-
-        group.clients.clear();
-    }
-
-    groups.clear();
-
-    log(
-        'Multi-Client Sync server plugin stopped',
+    console.log(
+        `[${PLUGIN_ID}] loaded (protocol ${PROTOCOL_VERSION}, epoch ${runtimeEpoch})`,
     );
 }
 
-// ---------------------------------------------------------------------------
-// Plugin export
-// ---------------------------------------------------------------------------
+
+/* -------------------------------------------------------------------------- */
+/* Plugin shutdown                                                             */
+/* -------------------------------------------------------------------------- */
+
+async function exit() {
+    if (scanTimer) {
+        clearInterval(
+            scanTimer,
+        );
+    }
+
+    scanTimer =
+        null;
+
+    for (
+        const timer of
+            persistTimers.values()
+    ) {
+        clearTimeout(
+            timer,
+        );
+    }
+
+    persistTimers.clear();
+
+    for (
+        const clients of
+            sseByScope.values()
+    ) {
+        for (
+            const res of clients
+        ) {
+            try {
+                sendSse(
+                    res,
+                    'shutdown',
+                    {
+                        reason:
+                            'server_shutdown',
+
+                        epoch:
+                            runtimeEpoch,
+                    },
+                );
+
+                res.end();
+            } catch {
+                // ignored
+            }
+        }
+    }
+
+    sseByScope.clear();
+
+    await Promise.all(
+        [
+            ...scopes.values(),
+        ].map(
+            record =>
+                persistScope(
+                    record,
+                ),
+        ),
+    );
+
+    console.log(
+        `[${PLUGIN_ID}] unloaded`,
+    );
+}
+
+
+/* -------------------------------------------------------------------------- */
+/* Exports                                                                     */
+/* -------------------------------------------------------------------------- */
 
 module.exports = {
     init,
     exit,
-
-    info: {
-        id:
-            PLUGIN_ID,
-
-        name:
-            'Multi-Client Chat Synchronization',
-
-        description:
-            'Authoritative server-side synchronization for multiple SillyTavern clients viewing the same chat.',
-    },
+    info,
 };
