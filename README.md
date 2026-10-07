@@ -25,4 +25,4 @@ git clone https://github.com/Samrwk99/multi-client-sync-plugin.git
 
 # Get the extension
 
-You can get the extension here: [Multi Client Sync Extension](https://github.com/Samrwk99/multi-client-sync-extension)
+You can get the extension and view the installation instructions here: [Multi Client Sync Extension](https://github.com/Samrwk99/multi-client-sync-extension)
