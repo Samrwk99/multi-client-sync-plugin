@@ -1,6 +1,6 @@
 ### Multi Client Sync Plugin
 # You need both the plugin and extension for this to work
-This project contains both a Sillytavern plugin and extension that sync up multiple tabs open connected to the same Sillytavern instance.
+This project contains both a Sillytavern [Plugin](https://github.com/Samrwk99/multi-client-sync-plugin) and [Extension](https://github.com/Samrwk99/multi-client-sync-extension) that sync up multiple tabs open connected to the same Sillytavern instance.
 It supports chat streaming, avoids having the same chat overwritten by another tab's usage and has the option to stop generations in another tab.
 
 
