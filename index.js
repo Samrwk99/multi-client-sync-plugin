@@ -621,7 +621,13 @@ function sendSseFrame(res, event, id = null) {
     if (id != null) out += `id: ${id}\n`;
     out += `event: ${String(event.type || 'message')}\n`;
     out += `data: ${payload}\n\n`;
-    return res.write(out);
+    const ok = res.write(out);
+    // Flush every SSE frame immediately; the transport must not buffer
+    // latency-sensitive generation events.
+    if (typeof res.flush === 'function') {
+        res.flush();
+    }
+    return ok;
 }
 
 function enqueueSseFrame(sub, frame, logicalEventId) {
@@ -1705,6 +1711,7 @@ async function handleGenerationUpdate(req, res, kind) {
                 messageIndex,
                 seq,
                 message,
+                cumulative: true,
             }, { id: 0, transferId: newTransferId() });
 
             g.phase = 'streaming';
@@ -1747,6 +1754,7 @@ async function handleGenerationUpdate(req, res, kind) {
                 type: 'generation_terminal',
                 generation: finished,
                 revision: newRevision,
+                finalSeq: Number(g.seq || 0),
                 snapshot: snap,
             }, { opId, fp: terminalFp });
 
@@ -1806,9 +1814,11 @@ async function handleGenerationStopRequest(req, res) {
             requesterClientId: member.clientId,
         }, { opId: opId || null, fp: opId ? stopFp : null });
         commitPreparedEvents(state, [prepared]);
+        // Publish the latency-sensitive event immediately; the generating
+        // client must not wait on persistence before learning it should stop.
+        publishPreparedEvent(req, scope, prepared);
         await persistState(req, scope, state);
         markPersisted(state, tx);
-        publishPreparedEvent(req, scope, prepared);
         return res.json({ ok: true, state: publicStateCompact(state) });
     });
 }
@@ -1845,6 +1855,7 @@ async function handleSse(req, res) {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
 
     const existing = set.get(clientId);
