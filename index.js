@@ -497,7 +497,9 @@ function publishPreparedEvent(req, scope, prepared) {
     // sends (id 0) never touch the cursor.
     const sseId = prepared.id > 0 ? prepared.id : null;
     for (const sub of set.values()) {
-        if (sub.closed) continue;
+        // Member-only placeholders (join without SSE, or a closed SSE
+        // connection kept for membership) are not deliverable targets.
+        if (sub.closed || !sub.outboundQueue) continue;
         for (const frame of prepared.frames) {
             try {
                 enqueueSseFrame(sub, frame, sseId);
@@ -527,7 +529,7 @@ function sendSseFrame(res, event, id = null) {
 }
 
 function enqueueSseFrame(sub, frame, logicalEventId) {
-    if (sub.closed) return;
+    if (sub.closed || !sub.outboundQueue) return;
     sub.outboundQueue.push({ frame, logicalEventId });
     sub.outboundBytes += utf8ByteLength(frame);
     // Overflow check runs BEFORE the replaying early-return: a slow replay
@@ -560,9 +562,11 @@ function flushSubscriberQueue(sub) {
 function closeSubscriber(sub, reason) {
     if (sub.closed) return;
     sub.closed = true;
-    sub.outboundQueue.length = 0;
-    sub.outboundBytes = 0;
-    try { sub.res.end(); } catch { /* ignore */ }
+    if (sub.outboundQueue) {
+        sub.outboundQueue.length = 0;
+        sub.outboundBytes = 0;
+    }
+    try { sub.res?.end(); } catch { /* ignore */ }
     void reason;
 }
 
