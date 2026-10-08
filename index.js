@@ -20,6 +20,8 @@ const LIMITS = Object.freeze({
     maxEventHistoryBytes: 4 * 1024 * 1024,
     maxEvents: 300,
     maxRecentOps: 1000,
+    maxDeltaOps: 500,
+    maxDeltaBytes: 256 * 1024,
     maxDeltaJournalBytes: 4 * 1024 * 1024,
     maxDeltaJournalHardBytes: 8 * 1024 * 1024,
     memberTtlMs: 60_000,
@@ -52,6 +54,10 @@ function bytes(value) { return utf8ByteLength(value); }
 function sha256(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
 function jsonSafeId(value) { return typeof value === 'string' && /^[A-Za-z0-9._~:-]{1,240}$/.test(value); }
 function isObject(value) { return value && typeof value === 'object' && !Array.isArray(value); }
+
+function operationFingerprint(parts) {
+    return sha256Bytes(Buffer.from(JSON.stringify(parts), 'utf8'));
+}
 
 function userRoot(req) {
     return req?.user?.directories?.root || req?.user?.directories?.data || req?.user?.directories?.user || null;
@@ -106,10 +112,12 @@ function canonicalSnapshot(input) {
     const seen = new Set();
     for (const message of messages) {
         if (!isObject(message)) throw new Error('invalid_message');
-        const id = message?.extra?.multi_client_sync?.messageId;
-        if (!jsonSafeId(String(id ?? ''))) throw new Error('message_ids_required');
-        if (seen.has(id)) throw new Error('duplicate_message_id');
-        seen.add(id);
+        // Message identity must be a validated string — never a numeric or
+        // otherwise coercible value that could alias across representations.
+        const rawId = message?.extra?.multi_client_sync?.messageId;
+        if (typeof rawId !== 'string' || !jsonSafeId(rawId)) throw new Error('message_ids_required');
+        if (seen.has(rawId)) throw new Error('duplicate_message_id');
+        seen.add(rawId);
     }
     return { messages, metadata: clone(isObject(input.metadata) ? input.metadata : {}) };
 }
@@ -120,6 +128,7 @@ function defaultState(scope) {
         schema: SCHEMA,
         scope: clone(scope),
         revision: 0,
+        seeded: false,
         snapshot: { messages: [], metadata: {} },
         generation: null,
         events: [],
@@ -140,10 +149,18 @@ function migrateState(parsed, scope) {
     }
     const state = defaultState(scope);
     state.revision = Number(parsed.revision || 0);
+    // revision 0 = never seeded; revision >= 1 = established state.
+    state.seeded = parsed.seeded === true || state.revision > 0;
     state.snapshot = canonicalSnapshot(parsed.snapshot || { messages: [], metadata: {} });
     state.events = Array.isArray(parsed.events) ? clone(parsed.events) : [];
     state.nextEventId = Number(parsed.nextEventId || 1);
-    state.recentOps = Array.isArray(parsed.recentOps) ? clone(parsed.recentOps) : [];
+    state.recentOps = (Array.isArray(parsed.recentOps) ? parsed.recentOps : [])
+        .map(entry => {
+            if (typeof entry === 'string') return { id: entry, fp: null };
+            if (isObject(entry) && entry.id) return { id: String(entry.id), fp: entry.fp || null };
+            return null;
+        })
+        .filter(Boolean);
     state.createdAt = Number(parsed.createdAt || now());
     state.updatedAt = Number(parsed.updatedAt || now());
     // A generation owned by a previous server process can never be resumed.
@@ -264,14 +281,18 @@ async function persistState(req, scope, state, { fsync = LIMITS.fsyncState } = {
         schema: state.schema,
         scope: state.scope,
         revision: state.revision,
+        seeded: state.seeded === true || Number(state.revision || 0) > 0,
         snapshot: state.snapshot,
         generation: state.generation ? generationPublic(state.generation, false) : null,
-        events: pruneEventHistory(state.events),
         nextEventId: state.nextEventId,
         recentOps: state.recentOps,
         createdAt: state.createdAt,
         updatedAt: now(),
     };
+    // pruneEventHistory mutates in place and returns undefined — build a
+    // pruned COPY for the projected payload (assigning its return value
+    // would silently null out the event history).
+    projected.events = Array.isArray(state.events) ? state.events.slice() : [];
     pruneEventHistory(projected);
 
     const payload = JSON.stringify(projected);
@@ -306,10 +327,8 @@ async function persistState(req, scope, state, { fsync = LIMITS.fsyncState } = {
     // Mirror compaction/pruning onto in-memory state so the cache matches disk
     // and long generations cannot grow memory without bound.
     state.updatedAt = projected.updatedAt;
-    if (Array.isArray(state.events)) {
-        state.events = pruneEventHistory(state.events);
-        pruneEventHistory(state);
-    }
+    if (!Array.isArray(state.events)) state.events = [];
+    pruneEventHistory(state);
 }
 
 function pruneEventHistory(state) {
@@ -394,15 +413,36 @@ async function withLock(req, scope, fn) {
     }
 }
 
-function rememberOp(state, opId) {
+// Idempotency entries carry an operation fingerprint: a retried opId with the
+// SAME payload is a duplicate; the same opId with a DIFFERENT payload is an
+// op_id_reuse conflict, never a silent discard.
+function rememberOp(state, opId, fp = null) {
     if (!opId) return;
-    state.recentOps.push(opId);
+    state.recentOps.push({ id: String(opId), fp: fp || null });
     if (state.recentOps.length > LIMITS.maxRecentOps) {
         state.recentOps.splice(0, state.recentOps.length - LIMITS.maxRecentOps);
     }
 }
 
-function hasOp(state, opId) { return !!opId && state.recentOps.includes(opId); }
+function findOp(state, opId) {
+    if (!opId) return null;
+    for (let i = state.recentOps.length - 1; i >= 0; i -= 1) {
+        const entry = state.recentOps[i];
+        if (typeof entry === 'string') {
+            if (entry === opId) return { id: entry, fp: null };
+            continue;
+        }
+        if (entry?.id === opId) return entry;
+    }
+    return null;
+}
+
+function duplicateOpResponse(res, state, prior, fp, compact = false) {
+    if (prior.fp && fp && prior.fp !== fp) {
+        return res.status(409).json({ ok: false, error: 'op_id_reuse' });
+    }
+    return res.json({ ok: true, state: compact ? publicStateCompact(state) : publicState(state), duplicate: true });
+}
 
 function revisionError(state) {
     return {
@@ -423,7 +463,7 @@ function revisionError(state) {
 // stream messages never sit in event history, in memory or on disk.
 // ---------------------------------------------------------------------------
 
-function prepareEvent(state, logicalEvent, { id = null, opId = null, transferId = null } = {}) {
+function prepareEvent(state, logicalEvent, { id = null, opId = null, transferId = null, fp = null } = {}) {
     const eventId = id ?? state.nextEventId;
     const at = now();
 
@@ -447,6 +487,7 @@ function prepareEvent(state, logicalEvent, { id = null, opId = null, transferId 
             id: eventId,
             at,
             opId,
+            fp,
             storedEvent: durableEvent,
             frames: [fullEvent],
             totalBytes,
@@ -501,6 +542,7 @@ function prepareEvent(state, logicalEvent, { id = null, opId = null, transferId 
         id: eventId,
         at,
         opId,
+        fp,
         storedEvent: compactMarker,
         frames,
         totalBytes,
@@ -511,17 +553,18 @@ function prepareEvent(state, logicalEvent, { id = null, opId = null, transferId 
 function prepareEvents(state, logicalEvents) {
     let nextId = state.nextEventId;
     const prepared = [];
-    for (const { event, opId, transferId } of logicalEvents) {
-        prepared.push(prepareEvent(state, event, { id: nextId++, opId, transferId }));
+    for (const { event, opId, transferId, fp } of logicalEvents) {
+        prepared.push(prepareEvent(state, event, { id: nextId++, opId, transferId, fp }));
     }
     return prepared;
 }
 
 function commitPreparedEvents(state, preparedEvents) {
+    if (!Array.isArray(state.events)) state.events = [];
     for (const prepared of preparedEvents) {
         state.events.push(clone(prepared.storedEvent));
         state.nextEventId = Math.max(state.nextEventId, prepared.id + 1);
-        if (prepared.opId) rememberOp(state, prepared.opId);
+        if (prepared.opId) rememberOp(state, prepared.opId, prepared.fp);
     }
 }
 
@@ -593,10 +636,14 @@ function enqueueSseFrame(sub, frame, logicalEventId) {
     flushSubscriberQueue(sub);
 }
 
+// Once res.write(frame) returns false, that frame has ALREADY been accepted
+// by the writable stream — it must never be written again. Frames are
+// therefore dequeued BEFORE the write; a false return only pauses the loop
+// until the drain event resumes it.
 function flushSubscriberQueue(sub) {
     if (sub.closed || sub.replaying) return;
     while (sub.outboundQueue.length > 0) {
-        const item = sub.outboundQueue[0];
+        const item = sub.outboundQueue.shift();
         let ok;
         try {
             ok = sendSseFrame(sub.res, item.frame, item.logicalEventId);
@@ -604,15 +651,18 @@ function flushSubscriberQueue(sub) {
             closeSubscriber(sub, 'send_error');
             return;
         }
-        if (!ok) break; // wait for drain
-        sub.outboundQueue.shift();
-        sub.outboundBytes -= utf8ByteLength(item.frame);
+        sub.outboundBytes = Math.max(0, sub.outboundBytes - utf8ByteLength(item.frame));
+        if (!ok) {
+            if (!sub.waitingForDrain) sub.waitingForDrain = true;
+            return; // 'drain' handler resumes flushing
+        }
     }
 }
 
 function closeSubscriber(sub, reason) {
-    if (sub.closed) return;
+    if (!sub || sub.closed) return;
     sub.closed = true;
+    sub.waitingForDrain = false;
     if (sub.outboundQueue) {
         sub.outboundQueue.length = 0;
         sub.outboundBytes = 0;
@@ -629,9 +679,14 @@ function createSubscriber(res, member, { supportsDelta = false } = {}) {
         replaying: true,
         outboundQueue: [],
         outboundBytes: 0,
+        waitingForDrain: false,
         closed: false,
     };
-    sub.res.on('drain', () => flushSubscriberQueue(sub));
+    sub.res.on('drain', () => {
+        if (sub.closed) return;
+        sub.waitingForDrain = false;
+        flushSubscriberQueue(sub);
+    });
     return sub;
 }
 
@@ -838,11 +893,13 @@ function requireMember(req, res, scope, body) {
 const MCS_META_KEY = 'multi_client_sync';
 const forbiddenKeys = new Set(['__proto__', 'prototype', 'constructor']);
 
+// Null-prototype containers: message IDs are arbitrary attacker-adjacent
+// strings and must never resolve through Object.prototype.
 function readDeltaTombstones(metadata) {
     const meta = metadata?.[MCS_META_KEY];
     const tomb = meta?.tombstones;
-    if (!tomb || typeof tomb !== 'object' || Array.isArray(tomb)) return {};
-    const out = {};
+    if (!tomb || typeof tomb !== 'object' || Array.isArray(tomb)) return Object.create(null);
+    const out = Object.create(null);
     for (const [id, value] of Object.entries(tomb)) {
         if (forbiddenKeys.has(id)) continue;
         const ts = Number(value);
@@ -865,7 +922,7 @@ function writeDeltaTombstones(metadata, tombstones) {
     }
     const next = clone(metadata || {});
     const bucket = isObject(next[MCS_META_KEY]) ? next[MCS_META_KEY] : {};
-    bucket.tombstones = tombstones;
+    bucket.tombstones = JSON.parse(JSON.stringify(tombstones));
     next[MCS_META_KEY] = bucket;
     return next;
 }
@@ -903,7 +960,7 @@ function applyDeltaToSnapshot(baseSnapshot, ops) {
                 indexById = reindex();
             }
             ensureMetadataCopy();
-            if (!tombstones[id] || deletedAt > tombstones[id]) tombstones[id] = deletedAt;
+            if (!Object.hasOwn(tombstones, id) || deletedAt > tombstones[id]) tombstones[id] = deletedAt;
             continue;
         }
 
@@ -913,7 +970,7 @@ function applyDeltaToSnapshot(baseSnapshot, ops) {
             const modifiedAt = Number(op.modifiedAt || now());
             if (!jsonSafeId(id)) throw new Error('message_ids_required');
             if (!Number.isFinite(modifiedAt) || modifiedAt <= 0) throw new Error('invalid_modified_timestamp');
-            if (tombstones[id] && modifiedAt <= tombstones[id]) throw new Error('delta_stale_message');
+            if (Object.hasOwn(tombstones, id) && modifiedAt <= tombstones[id]) throw new Error('delta_stale_message');
 
             const currentIndex = indexById.get(id);
             if (currentIndex !== undefined) {
@@ -929,7 +986,7 @@ function applyDeltaToSnapshot(baseSnapshot, ops) {
                 messages.splice(insertAt, 0, msg);
                 indexById = reindex();
             }
-            if (tombstones[id]) {
+            if (Object.hasOwn(tombstones, id)) {
                 ensureMetadataCopy();
                 delete tombstones[id];
             }
@@ -1058,6 +1115,7 @@ async function replayDeltaJournal(req, scope, state) {
         state.snapshot = applyDeltaToSnapshot(state.snapshot, event.ops);
         state.revision = Number(event.revision);
         state.updatedAt = Number(event.at || now());
+        if (!Array.isArray(state.events)) state.events = [];
         state.events.push(clone(event));
         state.nextEventId = eventId + 1;
         highestEventId = eventId;
@@ -1081,7 +1139,9 @@ async function handleDelta(req, res) {
     if (!jsonSafeId(opId)) return res.status(400).json({ ok: false, error: 'invalid_op_id' });
 
     const ops = Array.isArray(body.ops) ? body.ops : null;
-    if (!ops || ops.length === 0 || ops.length > 500) {
+    // Server-side validation is authoritative: never trust the client's
+    // DELTA_MAX_OPS / DELTA_MAX_BYTES for safety.
+    if (!ops || ops.length === 0 || ops.length > LIMITS.maxDeltaOps) {
         return res.status(400).json({ ok: false, error: 'invalid_ops' });
     }
 
@@ -1108,16 +1168,17 @@ async function handleDelta(req, res) {
                 if (op.afterMessageId != null && String(op.afterMessageId) === opMessageId) throw new Error('delta_move_self');
             }
         }
-        if (bytes({ ops }) > LIMITS.maxEventBytes - 4096) throw new Error('delta_too_large');
+        if (bytes({ ops }) > LIMITS.maxDeltaBytes) throw new Error('delta_too_large');
     } catch (error) {
         return res.status(error.message === 'delta_too_large' ? 413 : 400).json({ ok: false, error: error.message });
     }
 
+    const deltaFp = operationFingerprint([member.clientId, 'delta', ops]);
+
     return withLock(req, scope, async (state, tx) => {
         // A duplicate may be a timed-out client retrying: return the authoritative state.
-        if (hasOp(state, opId)) {
-            return res.json({ ok: true, state: publicState(state), duplicate: true });
-        }
+        const prior = findOp(state, opId);
+        if (prior) return duplicateOpResponse(res, state, prior, deltaFp);
         if (expireGeneration(state)) {
             const recovery = prepareEvent(state, { type: 'generation_recovered', generation: null });
             commitPreparedEvents(state, [recovery]);
@@ -1151,7 +1212,7 @@ async function handleDelta(req, res) {
             baseRevision: Number(body.baseRevision),
             ops: clone(ops),
             sourceClientId: member.clientId,
-        }, { opId });
+        }, { opId, fp: deltaFp });
 
         // A delta that would chunk cannot be journaled or replayed: reject it
         // so the client falls back to the full snapshot path.
@@ -1177,8 +1238,23 @@ async function handleDelta(req, res) {
                 console.warn('[multi-client-sync] delta journal compaction deferred:', error?.message || error);
             }
         }
+
+        // Hard ceiling: force compaction. If the journal somehow still
+        // exceeds it, fail the request so the client falls back to the
+        // snapshot path instead of allowing unbounded journal growth.
         if (journalSize > LIMITS.maxDeltaJournalHardBytes) {
-            console.warn('[multi-client-sync] delta journal exceeded hard target:', journalSize);
+            let remaining = journalSize;
+            try {
+                await persistState(req, scope, state);
+                const stat = await fsp.stat(deltaJournalPath(req, scope)).catch(() => null);
+                remaining = stat ? stat.size : 0;
+            } catch (error) {
+                console.warn('[multi-client-sync] delta journal hard-limit compaction failed:', error?.message || error);
+            }
+            if (remaining > LIMITS.maxDeltaJournalHardBytes) {
+                console.warn('[multi-client-sync] delta journal exceeded hard limit:', remaining);
+                return res.status(500).json({ ok: false, error: 'delta_journal_hard_limit_exceeded' });
+            }
         }
 
         publishPreparedEvent(req, scope, prepared);
@@ -1203,8 +1279,9 @@ async function handlePing(req, res) {
 }
 
 // Two-phase join: an established scope never needs the client's snapshot, so
-// the client joins WITHOUT it first. Only when the server has no state at all
-// does it ask for a seed, and only then does the client upload the chat.
+// the client joins WITHOUT it first. Only when the server has never been
+// seeded at all does it ask for a seed, and only then does the client upload
+// the chat. `seeded` (not member count, not revision alone) decides.
 async function handleJoin(req, res) {
     if (!requireAuth(req, res)) return;
     const body = req.body || {};
@@ -1215,6 +1292,13 @@ async function handleJoin(req, res) {
     const deviceId = String(body.deviceId || '');
     if (!jsonSafeId(clientId) || !jsonSafeId(deviceId)) {
         return res.status(400).json({ ok: false, error: 'invalid_client' });
+    }
+    // Membership is bound to an exact connection identity so a delayed
+    // /leave or /heartbeat from a previous connection cannot evict the
+    // current one.
+    const connectionId = String(body.connectionId || '');
+    if (!jsonSafeId(connectionId)) {
+        return res.status(400).json({ ok: false, error: 'invalid_connection_id' });
     }
 
     const skey = `${userKey(req)}::${scopeKey(scope)}`;
@@ -1233,22 +1317,37 @@ async function handleJoin(req, res) {
         enforceScopeCacheLimit(req);
         const state = await loadState(req, scope);
 
-        if (state.revision === 0 && set.size === 0 && !body.snapshot) {
+        if (!state.seeded && set.size === 0 && !body.snapshot) {
             // No server state and no other members: this client must seed.
             return res.json({ ok: true, seedRequired: true, state: publicState(state), members: publicMembers(req, scope) });
         }
 
-        if (state.revision === 0 && set.size === 0 && body.snapshot) {
-            // Initial seed is transactional: a failed persist rolls memory back.
+        if (!state.seeded && set.size === 0 && body.snapshot) {
+            // Initial seed is a real state transition: revision 1, a durable
+            // snapshot event, and the seeded marker so an established scope is
+            // never re-seeded regardless of member count or future revisions.
             const tx = beginStateTransaction(state);
             try {
-                state.snapshot = canonicalSnapshot(body.snapshot);
-                if (bytes(state.snapshot) > LIMITS.maxSnapshotBytes) {
+                const seededSnapshot = canonicalSnapshot(body.snapshot);
+                if (bytes(seededSnapshot) > LIMITS.maxSnapshotBytes) {
                     rollbackTransaction(state, tx);
                     return res.status(413).json({ ok: false, error: 'snapshot_too_large' });
                 }
+                state.snapshot = seededSnapshot;
+                state.seeded = true;
+                state.revision = Math.max(1, Number(state.revision || 0));
+                state.updatedAt = now();
+                if (!Array.isArray(state.events)) state.events = [];
+                const prepared = prepareEvent(state, {
+                    type: 'snapshot',
+                    revision: state.revision,
+                    snapshot: state.snapshot,
+                    sourceClientId: clientId,
+                });
+                commitPreparedEvents(state, [prepared]);
                 await persistState(req, scope, state);
                 markPersisted(state, tx);
+                publishPreparedEvent(req, scope, prepared);
             } catch (error) {
                 if (!tx.persisted) rollbackTransaction(state, tx);
                 if (error instanceof Error && ['snapshot_required', 'snapshot_messages_required', 'invalid_message', 'message_ids_required', 'duplicate_message_id'].includes(error.message)) {
@@ -1262,9 +1361,18 @@ async function handleJoin(req, res) {
         if (liveEntry?.res && !liveEntry.closed) {
             // A live SSE connection exists for this client: refresh membership
             // in place instead of replacing the entry with a placeholder.
-            liveEntry.member = { clientId, deviceId, joinedAt: liveEntry.member?.joinedAt || now(), lastSeenAt: now() };
+            liveEntry.member = {
+                clientId,
+                deviceId,
+                connectionId,
+                joinedAt: liveEntry.member?.joinedAt || now(),
+                lastSeenAt: now(),
+            };
         } else {
-            set.set(clientId, { member: { clientId, deviceId, joinedAt: now(), lastSeenAt: now() }, res: null });
+            set.set(clientId, {
+                member: { clientId, deviceId, connectionId, joinedAt: now(), lastSeenAt: now() },
+                res: null,
+            });
         }
         return res.json({ ok: true, state: publicState(state), members: publicMembers(req, scope) });
     } finally {
@@ -1283,10 +1391,16 @@ async function handleLeave(req, res) {
     if (set) {
         const entry = set.get(String(body.clientId || ''));
         if (entry?.member?.deviceId === String(body.deviceId || '')) {
-            if (entry.res && !entry.closed) {
-                try { entry.res.end(); } catch { /* ignore */ }
+            // A leave must match the exact membership connection: a delayed
+            // leave from an older connection must not evict the current one.
+            const memberConnectionId = entry.member.connectionId || '';
+            const matchesConnection = !memberConnectionId || memberConnectionId === String(body.connectionId || '');
+            if (matchesConnection) {
+                if (entry.res && !entry.closed) {
+                    try { entry.res.end(); } catch { /* ignore */ }
+                }
+                set.delete(String(body.clientId || ''));
             }
-            set.delete(String(body.clientId || ''));
         }
         if (set.size === 0) subscribers.delete(skey);
     }
@@ -1365,10 +1479,11 @@ async function handleSnapshot(req, res) {
         return res.status(413).json({ ok: false, error: 'snapshot_too_large' });
     }
 
+    const snapFp = operationFingerprint([member.clientId, 'snapshot', snap]);
+
     return withLock(req, scope, async (state, tx) => {
-        if (hasOp(state, opId)) {
-            return res.json({ ok: true, state: publicState(state), duplicate: true });
-        }
+        const prior = findOp(state, opId);
+        if (prior) return duplicateOpResponse(res, state, prior, snapFp);
         if (expireGeneration(state)) {
             const recovery = prepareEvent(state, { type: 'generation_recovered', generation: null });
             commitPreparedEvents(state, [recovery]);
@@ -1389,9 +1504,10 @@ async function handleSnapshot(req, res) {
             revision: newRevision,
             snapshot: snap,
             sourceClientId: member.clientId,
-        }, { opId });
+        }, { opId, fp: snapFp });
 
         state.snapshot = snap;
+        state.seeded = true;
         state.revision = newRevision;
         state.updatedAt = now();
         commitPreparedEvents(state, [prepared]);
@@ -1418,10 +1534,11 @@ async function handleGenerationClaim(req, res) {
         return res.status(400).json({ ok: false, error: e.message });
     }
 
+    const claimFp = operationFingerprint([member.clientId, 'claim', String(body.generationId || ''), snap]);
+
     return withLock(req, scope, async (state, tx) => {
-        if (hasOp(state, opId)) {
-            return res.json({ ok: true, state: publicState(state), duplicate: true });
-        }
+        const prior = findOp(state, opId);
+        if (prior) return duplicateOpResponse(res, state, prior, claimFp);
         if (state.generation) {
             const expired = expireGeneration(state);
             if (expired) {
@@ -1462,10 +1579,12 @@ async function handleGenerationClaim(req, res) {
                     revision: newRevision,
                 },
                 opId,
+                fp: claimFp,
             },
         ]);
 
         state.snapshot = snap;
+        state.seeded = true;
         state.revision = newRevision;
         state.updatedAt = now();
         state.generation = generation;
@@ -1529,6 +1648,16 @@ async function handleGenerationUpdate(req, res, kind) {
         }
 
         if (kind === 'stream') {
+            // The server is the final authority on generation end-state: a
+            // terminalizing or stop-requested generation never accepts more
+            // stream frames, regardless of client timing.
+            const currentPhase = String(g.phase || '');
+            if (['completed', 'stopped', 'failed', 'terminal'].includes(currentPhase)) {
+                return res.status(409).json({ ok: false, error: 'generation_terminal', state: publicStateCompact(state) });
+            }
+            if (g.stopRequested) {
+                return res.status(409).json({ ok: false, error: 'generation_stop_requested', state: publicStateCompact(state) });
+            }
             if (!['started', 'streaming'].includes(g.phase)) {
                 return res.status(409).json({ ok: false, error: 'generation_not_started' });
             }
@@ -1551,10 +1680,11 @@ async function handleGenerationUpdate(req, res, kind) {
             if (!isObject(message)) {
                 return res.status(400).json({ ok: false, error: 'stream_message_required' });
             }
-            const id = message?.extra?.multi_client_sync?.messageId;
-            if (!jsonSafeId(String(id || ''))) {
+            const rawId = message?.extra?.multi_client_sync?.messageId;
+            if (typeof rawId !== 'string' || !jsonSafeId(rawId)) {
                 return res.status(400).json({ ok: false, error: 'message_ids_required' });
             }
+            const id = rawId;
             const messageIndex = Number.isInteger(body.messageIndex) ? body.messageIndex : null;
 
             // Event metadata reflects the POST-update state, built without
@@ -1594,9 +1724,6 @@ async function handleGenerationUpdate(req, res, kind) {
         if (kind === 'terminal') {
             const opId = String(body.opId || '');
             if (!jsonSafeId(opId)) return res.status(400).json({ ok: false, error: 'invalid_op_id' });
-            if (hasOp(state, opId)) {
-                return res.json({ ok: true, state: publicState(state), duplicate: true });
-            }
 
             let snap;
             try { snap = canonicalSnapshot(body.snapshot); } catch (error) {
@@ -1606,18 +1733,25 @@ async function handleGenerationUpdate(req, res, kind) {
                 return res.status(413).json({ ok: false, error: 'snapshot_too_large' });
             }
 
+            const terminalPhase = String(body.phase || 'completed');
+            const terminalFp = operationFingerprint([member.clientId, 'terminal', g.generationId, terminalPhase, snap]);
+
+            const prior = findOp(state, opId);
+            if (prior) return duplicateOpResponse(res, state, prior, terminalFp);
+
             const newRevision = state.revision + 1;
             const finished = generationPublic(g, false);
-            finished.phase = String(body.phase || 'completed');
+            finished.phase = terminalPhase;
 
             const prepared = prepareEvent(state, {
                 type: 'generation_terminal',
                 generation: finished,
                 revision: newRevision,
                 snapshot: snap,
-            }, { opId });
+            }, { opId, fp: terminalFp });
 
             state.snapshot = snap;
+            state.seeded = true;
             state.revision = newRevision;
             state.updatedAt = now();
             state.generation = null;
@@ -1648,9 +1782,11 @@ async function handleGenerationStopRequest(req, res) {
     const member = requireMember(req, res, scope, body);
     if (!member) return;
     const opId = String(body.opId || '');
+    const stopFp = operationFingerprint([member.clientId, 'stop', String(body.generationId || '')]);
     return withLock(req, scope, async (state, tx) => {
-        if (opId && hasOp(state, opId)) {
-            return res.json({ ok: true, state: publicStateCompact(state), duplicate: true });
+        if (opId) {
+            const prior = findOp(state, opId);
+            if (prior) return duplicateOpResponse(res, state, prior, stopFp, true);
         }
         if (expireGeneration(state)) {
             const recovered = prepareEvent(state, { type: 'generation_recovered', generation: null });
@@ -1668,7 +1804,7 @@ async function handleGenerationStopRequest(req, res) {
             type: 'generation_stop_requested',
             generation: generationPublic(state.generation, false),
             requesterClientId: member.clientId,
-        }, { opId: opId || null });
+        }, { opId: opId || null, fp: opId ? stopFp : null });
         commitPreparedEvents(state, [prepared]);
         await persistState(req, scope, state);
         markPersisted(state, tx);
