@@ -262,7 +262,7 @@ async function persistState(req, scope, state, { fsync = LIMITS.fsyncState } = {
         revision: state.revision,
         snapshot: state.snapshot,
         generation: state.generation ? generationPublic(state.generation, false) : null,
-        events: compactEvents(state.events),
+        events: pruneEventHistory(state.events),
         nextEventId: state.nextEventId,
         recentOps: state.recentOps,
         createdAt: state.createdAt,
@@ -303,7 +303,7 @@ async function persistState(req, scope, state, { fsync = LIMITS.fsyncState } = {
     // and long generations cannot grow memory without bound.
     state.updatedAt = projected.updatedAt;
     if (Array.isArray(state.events)) {
-        state.events = compactEvents(state.events);
+        state.events = pruneEventHistory(state.events);
         pruneEventHistory(state);
     }
 }
