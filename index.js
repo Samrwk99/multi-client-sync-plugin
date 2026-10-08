@@ -181,9 +181,27 @@ async function loadState(req, scope) {
             state = migrateState(parsed, scope);
             if (parsed.generation) recovered = true;
         } catch (error) {
-            if (error?.code !== 'ENOENT') throw error;
-            // No file: fresh default state. Version/scope mismatches throw above
-            // and surface to the caller; persisted state is never silently reset.
+            if (error?.code === 'ENOENT') {
+                // No file: fresh default state.
+            } else if (
+                error instanceof SyntaxError ||
+                (error instanceof Error && (
+                    error.message.startsWith('unsupported_state_version') ||
+                    error.message === 'state_scope_mismatch' ||
+                    error.message === 'invalid_state_structure'
+                ))
+            ) {
+                // Incompatible or corrupt persisted state: delete it and start
+                // fresh. The scope re-seeds from the first client that joins.
+                // The state file is sync bookkeeping, never the chat's source
+                // of truth, so this is a safe standing upgrade policy.
+                try {
+                    await fsp.unlink(statePath(req, scope));
+                } catch { /* best effort; file may already be gone */ }
+                console.warn(`[multi-client-sync] deleted incompatible state for ${sha256(scopeKey(scope))}: ${error.message}`);
+            } else {
+                throw error;
+            }
         }
 
         state.updatedAt = now();
