@@ -13,10 +13,15 @@ const LIMITS = Object.freeze({
     maxSnapshotBytes: 12 * 1024 * 1024,
     maxEventBytes: 512 * 1024,
     chunkPayloadBytes: 256 * 1024,
-    maxChunkAssemblyBytes: 12 * 1024 * 1024,
+    // Headroom above maxSnapshotBytes: the event envelope (wrapper keys +
+    // JSON escaping inflation) can push a legal 12 MiB snapshot past the
+    // assembly ceiling and turn a valid publish into event_too_large.
+    maxChunkAssemblyBytes: 12 * 1024 * 1024 + 256 * 1024,
     maxEventHistoryBytes: 4 * 1024 * 1024,
     maxEvents: 300,
-    maxRecentOps: 500,
+    maxRecentOps: 1000,
+    maxDeltaJournalBytes: 4 * 1024 * 1024,
+    maxDeltaJournalHardBytes: 8 * 1024 * 1024,
     memberTtlMs: 60_000,
     heartbeatMinMs: 3_000,
     generationLeaseMs: 30_000,
@@ -26,13 +31,6 @@ const LIMITS = Object.freeze({
     maxBufferedSseBytes: 4 * 1024 * 1024,
     fsyncState: false,
 });
-
-// Stream updates are transient: persisting the full state on every ~60ms
-// token update is catastrophic for large chats. Throttle durable writes;
-// the live message lives in memory + SSE only, and a crash mid-stream kills
-// the generation anyway (clients recover via generation_recovered).
-const STREAM_PERSIST_INTERVAL_MS = 2_000;
-const lastStreamPersistAt = new Map();
 
 const scopes = new Map();
 const userLocks = new Map();
@@ -209,6 +207,18 @@ async function loadState(req, scope) {
             }
         }
 
+        // Replay deltas journaled since the last full state write. On
+        // corruption: keep the valid persisted state and the checksum-valid
+        // replayed prefix, discard only the journal, and bump nextEventId
+        // past the observed high-water mark — clients that already consumed
+        // journaled events must never see those event IDs reused.
+        const journal = await replayDeltaJournal(req, scope, state);
+        if (!journal.ok) {
+            console.warn(`[multi-client-sync] delta journal corrupt for ${sha256(scopeKey(scope))}; discarding journal, keeping persisted state (valid prefix through event ${journal.highestEventId})`);
+            await clearDeltaJournal(req, scope);
+            state.nextEventId = Math.max(state.nextEventId, journal.highestEventId + 1000);
+        }
+
         state.updatedAt = now();
         const freshEntry = scopes.get(key) || {};
         freshEntry.state = state;
@@ -236,18 +246,6 @@ async function loadState(req, scope) {
     });
 
     return loading;
-}
-
-// Stream events are transient: the live message never lives in durable or
-// in-memory history. Applied to event lists so memory stays bounded.
-function compactEvents(events) {
-    if (!Array.isArray(events)) return events;
-    return events.map(event => {
-        if (event?.type === 'generation_stream') {
-            return { ...event, message: undefined, compacted: true };
-        }
-        return event;
-    });
 }
 
 // Direct projection: NO full-state clone. The snapshot/scope are referenced —
@@ -292,6 +290,10 @@ async function persistState(req, scope, state, { fsync = LIMITS.fsyncState } = {
             finally { if (dirFd) await dirFd.close().catch(() => {}); }
         }
         try { await fsp.chmod(file, 0o600); } catch { /* best effort */ }
+
+        // The compacted state file now contains everything the delta journal
+        // held. Never let journal cleanup fail an already-successful commit.
+        await clearDeltaJournal(req, scope);
     } catch (error) {
         try { await fsp.unlink(tmp); } catch { /* ignore */ }
         throw error;
@@ -521,14 +523,35 @@ function commitPreparedEvents(state, preparedEvents) {
 
 function publishPreparedEvent(req, scope, prepared) {
     const set = subscribers.get(`${userKey(req)}::${scopeKey(scope)}`) || new Map();
-    const sseId = prepared.id > 0 ? prepared.id : null;
+    const isDelta = prepared?.storedEvent?.type === 'snapshot_delta';
+
     for (const sub of set.values()) {
         // Member-only placeholders (join without SSE, or a closed SSE
         // connection kept for membership) are not deliverable targets.
         if (sub.closed || !sub.outboundQueue) continue;
-        for (const frame of prepared.frames) {
+
+        // Old clients do not understand snapshot_delta. Never let them
+        // silently miss the mutation: force an authoritative resync.
+        if (isDelta && !sub.supportsDelta) {
             try {
-                enqueueSseFrame(sub, frame, sseId);
+                enqueueSseFrame(sub, { type: 'resync_required' }, null);
+            } catch {
+                closeSubscriber(sub, 'delta_compatibility_failure');
+            }
+            continue;
+        }
+
+        for (let i = 0; i < prepared.frames.length; i += 1) {
+            // Only the FINAL frame of a transfer advances the native SSE
+            // cursor. Intermediate chunks carry no id, so a mid-transfer
+            // disconnect reconnects with Last-Event-ID = the previous logical
+            // event; replay then hits the event_chunked marker and forces a
+            // clean resync instead of silently skipping the remainder.
+            const sseId = prepared.id > 0 && i === prepared.frames.length - 1
+                ? prepared.id
+                : null;
+            try {
+                enqueueSseFrame(sub, prepared.frames[i], sseId);
             } catch {
                 closeSubscriber(sub, 'enqueue_error');
                 break;
@@ -594,10 +617,11 @@ function closeSubscriber(sub, reason) {
     void reason;
 }
 
-function createSubscriber(res, member) {
+function createSubscriber(res, member, { supportsDelta = false } = {}) {
     const sub = {
         res,
         member,
+        supportsDelta,
         replaying: true,
         outboundQueue: [],
         outboundBytes: 0,
@@ -613,7 +637,8 @@ function createSubscriber(res, member) {
 // publicState: full authoritative checkpoint (snapshot included) — /state,
 // /join, snapshot/claim/terminal success, and all 409 conflict bodies.
 // publicStateCompact: no snapshot — the hot generation paths (heartbeat,
-// started, stream, stop) must never clone/serialize a 12 MB chat.
+// started, stream, stop) and delta success must never clone/serialize a
+// 12 MB chat.
 // ---------------------------------------------------------------------------
 
 function publicState(state) {
@@ -800,6 +825,368 @@ function requireMember(req, res, scope, body) {
         return null;
     }
     return { clientId, deviceId };
+}
+
+// ---------------------------------------------------------------------------
+// Delta fast path
+// ---------------------------------------------------------------------------
+
+const MCS_META_KEY = 'multi_client_sync';
+const forbiddenKeys = new Set(['__proto__', 'prototype', 'constructor']);
+
+function readDeltaTombstones(metadata) {
+    const meta = metadata?.[MCS_META_KEY];
+    const tomb = meta?.tombstones;
+    if (!tomb || typeof tomb !== 'object' || Array.isArray(tomb)) return {};
+    const out = {};
+    for (const [id, value] of Object.entries(tomb)) {
+        if (forbiddenKeys.has(id)) continue;
+        const ts = Number(value);
+        if (Number.isFinite(ts) && ts > 0) out[id] = ts;
+    }
+    return out;
+}
+
+function writeDeltaTombstones(metadata, tombstones) {
+    if (!Object.keys(tombstones).length) {
+        if (metadata?.[MCS_META_KEY]?.tombstones) {
+            const next = clone(metadata);
+            if (next[MCS_META_KEY]) {
+                delete next[MCS_META_KEY].tombstones;
+                if (Object.keys(next[MCS_META_KEY]).length === 0) delete next[MCS_META_KEY];
+            }
+            return next;
+        }
+        return metadata;
+    }
+    const next = clone(metadata || {});
+    const bucket = isObject(next[MCS_META_KEY]) ? next[MCS_META_KEY] : {};
+    bucket.tombstones = tombstones;
+    next[MCS_META_KEY] = bucket;
+    return next;
+}
+
+// Shared operation model: server and client project deltas with identical
+// semantics (anchored inserts, timestamped deletes, explicit moves).
+function applyDeltaToSnapshot(baseSnapshot, ops) {
+    const messages = Array.isArray(baseSnapshot?.messages) ? baseSnapshot.messages.slice() : [];
+    let metadata = baseSnapshot?.metadata || {};
+    const tombstones = readDeltaTombstones(metadata);
+    let metadataChanged = false;
+    const ensureMetadataCopy = () => {
+        if (metadataChanged) return;
+        metadata = clone(metadata);
+        metadataChanged = true;
+    };
+    const reindex = () => {
+        const map = new Map();
+        for (let i = 0; i < messages.length; i += 1) {
+            const id = messages[i]?.extra?.multi_client_sync?.messageId;
+            if (jsonSafeId(String(id || ''))) map.set(String(id), i);
+        }
+        return map;
+    };
+    let indexById = reindex();
+
+    for (const op of ops) {
+        if (op.op === 'delete') {
+            const id = String(op.messageId);
+            const deletedAt = Number(op.deletedAt || now());
+            if (!Number.isFinite(deletedAt) || deletedAt <= 0) throw new Error('invalid_delete_timestamp');
+            const currentIndex = indexById.get(id);
+            if (currentIndex !== undefined) {
+                messages.splice(currentIndex, 1);
+                indexById = reindex();
+            }
+            ensureMetadataCopy();
+            if (!tombstones[id] || deletedAt > tombstones[id]) tombstones[id] = deletedAt;
+            continue;
+        }
+
+        if (op.op === 'upsert') {
+            const msg = clone(op.message);
+            const id = String(msg?.extra?.multi_client_sync?.messageId || '');
+            const modifiedAt = Number(op.modifiedAt || now());
+            if (!jsonSafeId(id)) throw new Error('message_ids_required');
+            if (!Number.isFinite(modifiedAt) || modifiedAt <= 0) throw new Error('invalid_modified_timestamp');
+            if (tombstones[id] && modifiedAt <= tombstones[id]) throw new Error('delta_stale_message');
+
+            const currentIndex = indexById.get(id);
+            if (currentIndex !== undefined) {
+                messages[currentIndex] = msg;
+            } else {
+                const afterId = op.afterMessageId == null ? null : String(op.afterMessageId);
+                let insertAt = 0;
+                if (afterId) {
+                    const afterIndex = indexById.get(afterId);
+                    if (afterIndex === undefined) throw new Error('delta_anchor_missing');
+                    insertAt = afterIndex + 1;
+                }
+                messages.splice(insertAt, 0, msg);
+                indexById = reindex();
+            }
+            if (tombstones[id]) {
+                ensureMetadataCopy();
+                delete tombstones[id];
+            }
+            continue;
+        }
+
+        if (op.op === 'move') {
+            const id = String(op.messageId);
+            const currentIndex = indexById.get(id);
+            if (currentIndex === undefined) throw new Error('delta_move_target_missing');
+            const afterId = op.afterMessageId == null ? null : String(op.afterMessageId);
+            if (afterId === id) throw new Error('delta_move_self');
+            const moved = messages[currentIndex];
+            messages.splice(currentIndex, 1);
+            indexById = reindex();
+            let insertAt = 0;
+            if (afterId) {
+                const afterIndex = indexById.get(afterId);
+                if (afterIndex === undefined) throw new Error('delta_move_anchor_missing');
+                insertAt = afterIndex + 1;
+            }
+            messages.splice(insertAt, 0, moved);
+            indexById = reindex();
+            continue;
+        }
+
+        throw new Error('invalid_delta_operation');
+    }
+
+    if (metadataChanged) metadata = writeDeltaTombstones(metadata, tombstones);
+
+    const ids = new Set();
+    for (const message of messages) {
+        const id = String(message?.extra?.multi_client_sync?.messageId || '');
+        if (!jsonSafeId(id)) throw new Error('message_ids_required');
+        if (ids.has(id)) throw new Error('duplicate_message_id');
+        ids.add(id);
+    }
+
+    return { messages, metadata };
+}
+
+// --- delta journal: small durable appends instead of full state rewrites ---
+
+function deltaJournalPath(req, scope) {
+    return path.join(stateRoot(req), `${sha256(scopeKey(scope))}.delta.ndjson`);
+}
+
+async function appendDeltaJournal(req, scope, prepared) {
+    const file = deltaJournalPath(req, scope);
+    await ensureDir(path.dirname(file));
+
+    const recordCore = { version: 1, id: prepared.id, opId: prepared.opId || null, event: prepared.storedEvent };
+    const record = { ...recordCore, recordSha256: sha256Bytes(Buffer.from(JSON.stringify(recordCore), 'utf8')) };
+    const payload = `${JSON.stringify(record)}\n`;
+
+    await fsp.appendFile(file, payload, { mode: 0o600 });
+    if (LIMITS.fsyncState) {
+        const fd = await fsp.open(file, 'r+');
+        try { await fd.sync(); } finally { await fd.close(); }
+    }
+
+    const stat = await fsp.stat(file);
+    return stat.size;
+}
+
+async function clearDeltaJournal(req, scope) {
+    try {
+        await fsp.unlink(deltaJournalPath(req, scope));
+    } catch (error) {
+        if (error?.code !== 'ENOENT') console.warn('[multi-client-sync] failed to clear delta journal:', error?.message || error);
+    }
+}
+
+async function replayDeltaJournal(req, scope, state) {
+    let raw;
+    try {
+        raw = await fsp.readFile(deltaJournalPath(req, scope), 'utf8');
+    } catch (error) {
+        if (error?.code === 'ENOENT') return { ok: true, highestEventId: 0 };
+        throw error;
+    }
+
+    const lines = raw.split('\n');
+    let replayed = false;
+    let highestEventId = 0;
+
+    for (let i = 0; i < lines.length; i += 1) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+
+        let record;
+        try {
+            record = JSON.parse(line);
+        } catch (error) {
+            // Truncated final append is discardable; mid-file corruption is not.
+            if (i === lines.length - 1) {
+                console.warn('[multi-client-sync] ignoring truncated final delta journal record');
+                break;
+            }
+            return { ok: false, highestEventId };
+        }
+
+        if (
+            !isObject(record) ||
+            record.version !== 1 ||
+            !isObject(record.event) ||
+            record.event.type !== 'snapshot_delta' ||
+            typeof record.recordSha256 !== 'string' ||
+            !/^[a-f0-9]{64}$/.test(record.recordSha256)
+        ) {
+            return { ok: false, highestEventId };
+        }
+
+        const { recordSha256, ...recordCore } = record;
+        if (recordSha256 !== sha256Bytes(Buffer.from(JSON.stringify(recordCore), 'utf8'))) {
+            return { ok: false, highestEventId };
+        }
+
+        const event = record.event;
+        const eventId = Number(event.id);
+        if (eventId < state.nextEventId) continue; // already compacted
+        if (eventId !== state.nextEventId) return { ok: false, highestEventId };
+        if (Number(event.baseRevision) !== Number(state.revision)) return { ok: false, highestEventId };
+
+        state.snapshot = applyDeltaToSnapshot(state.snapshot, event.ops);
+        state.revision = Number(event.revision);
+        state.updatedAt = Number(event.at || now());
+        state.events.push(clone(event));
+        state.nextEventId = eventId + 1;
+        highestEventId = eventId;
+        if (record.opId) rememberOp(state, record.opId);
+        replayed = true;
+    }
+
+    if (replayed) pruneEventHistory(state);
+    return { ok: true, highestEventId };
+}
+
+async function handleDelta(req, res) {
+    if (!requireAuth(req, res)) return;
+    const body = req.body || {};
+    const scope = body.scope;
+    const scopeError = validateScope(scope);
+    if (scopeError) return res.status(400).json({ ok: false, error: scopeError });
+    const member = requireMember(req, res, scope, body);
+    if (!member) return;
+    const opId = String(body.opId || '');
+    if (!jsonSafeId(opId)) return res.status(400).json({ ok: false, error: 'invalid_op_id' });
+
+    const ops = Array.isArray(body.ops) ? body.ops : null;
+    if (!ops || ops.length === 0 || ops.length > 500) {
+        return res.status(400).json({ ok: false, error: 'invalid_ops' });
+    }
+
+    try {
+        const seenOperationKeys = new Set();
+        for (const op of ops) {
+            if (!isObject(op) || !['upsert', 'delete', 'move'].includes(op.op)) throw new Error('invalid_op');
+            const opMessageId = String(op.messageId || op.message?.extra?.multi_client_sync?.messageId || '');
+            if (!jsonSafeId(opMessageId)) throw new Error('message_ids_required');
+
+            const operationKey = `${op.op}:${opMessageId}:${String(op.afterMessageId ?? '')}`;
+            if (seenOperationKeys.has(operationKey)) throw new Error('duplicate_delta_operation');
+            seenOperationKeys.add(operationKey);
+
+            if (op.op === 'upsert') {
+                const modifiedAt = Number(op.modifiedAt);
+                if (!Number.isFinite(modifiedAt) || modifiedAt <= 0) throw new Error('invalid_modified_timestamp');
+                if (op.afterMessageId != null && !jsonSafeId(String(op.afterMessageId))) throw new Error('invalid_delta_anchor');
+            } else if (op.op === 'delete') {
+                const deletedAt = Number(op.deletedAt);
+                if (!Number.isFinite(deletedAt) || deletedAt <= 0) throw new Error('invalid_delete_timestamp');
+            } else if (op.op === 'move') {
+                if (op.afterMessageId != null && !jsonSafeId(String(op.afterMessageId))) throw new Error('invalid_delta_anchor');
+                if (op.afterMessageId != null && String(op.afterMessageId) === opMessageId) throw new Error('delta_move_self');
+            }
+        }
+        if (bytes({ ops }) > LIMITS.maxEventBytes - 4096) throw new Error('delta_too_large');
+    } catch (error) {
+        return res.status(error.message === 'delta_too_large' ? 413 : 400).json({ ok: false, error: error.message });
+    }
+
+    return withLock(req, scope, async (state, tx) => {
+        // A duplicate may be a timed-out client retrying: return the authoritative state.
+        if (hasOp(state, opId)) {
+            return res.json({ ok: true, state: publicState(state), duplicate: true });
+        }
+        if (expireGeneration(state)) {
+            const recovery = prepareEvent(state, { type: 'generation_recovered', generation: null });
+            commitPreparedEvents(state, [recovery]);
+            await persistState(req, scope, state);
+            markPersisted(state, tx);
+            publishPreparedEvent(req, scope, recovery);
+        }
+        if (state.generation) {
+            return res.status(409).json({ ok: false, error: 'generation_active', state: publicState(state) });
+        }
+        if (Number(body.baseRevision) !== state.revision) {
+            return res.status(409).json(revisionError(state));
+        }
+
+        let projected;
+        try {
+            projected = applyDeltaToSnapshot(state.snapshot, ops);
+        } catch (error) {
+            return res.status(409).json({ ok: false, error: 'delta_conflict', reason: error.message, state: publicState(state) });
+        }
+
+        // A small delta can still add a huge message: verify the RESULT fits.
+        if (bytes(projected) > LIMITS.maxSnapshotBytes) {
+            return res.status(413).json({ ok: false, error: 'snapshot_too_large' });
+        }
+
+        const newRevision = state.revision + 1;
+        const prepared = prepareEvent(state, {
+            type: 'snapshot_delta',
+            revision: newRevision,
+            baseRevision: Number(body.baseRevision),
+            ops: clone(ops),
+            sourceClientId: member.clientId,
+        }, { opId });
+
+        // A delta that would chunk cannot be journaled or replayed: reject it
+        // so the client falls back to the full snapshot path.
+        if (prepared.kind === 'chunked') {
+            return res.status(413).json({ ok: false, error: 'delta_too_large' });
+        }
+
+        state.snapshot = projected;
+        state.revision = newRevision;
+        state.updatedAt = now();
+        commitPreparedEvents(state, [prepared]);
+
+        // Fast path: small durable append instead of rewriting the state file.
+        // Journal durability commits the mutation; a failed compaction must
+        // never roll it back.
+        const journalSize = await appendDeltaJournal(req, scope, prepared);
+        markPersisted(state, tx);
+
+        if (journalSize >= LIMITS.maxDeltaJournalBytes) {
+            try {
+                await persistState(req, scope, state);
+            } catch (error) {
+                console.warn('[multi-client-sync] delta journal compaction deferred:', error?.message || error);
+            }
+        }
+        if (journalSize > LIMITS.maxDeltaJournalHardBytes) {
+            console.warn('[multi-client-sync] delta journal exceeded hard target:', journalSize);
+        }
+
+        publishPreparedEvent(req, scope, prepared);
+
+        // NEVER publicState() here — compact response only.
+        return res.json({
+            ok: true,
+            state: publicStateCompact(state),
+            deltaRevision: newRevision,
+            deltaEventId: prepared.id,
+        });
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,13 +1561,17 @@ async function handleGenerationUpdate(req, res, kind) {
             updatedPublic.messageId = id;
             updatedPublic.messageIndex = messageIndex;
 
-            const prepared = prepareEvent(state, {
+            // generation_stream is fully transient: no durable event ID, no
+            // event history, no state-file write. SSE delivery only. The
+            // durable generation is metadata-only and nulled on load anyway,
+            // so persisting stream state bought nothing.
+            const prepared = prepareEvent({ nextEventId: 0 }, {
                 type: 'generation_stream',
                 generation: updatedPublic,
                 messageIndex,
                 seq,
                 message,
-            });
+            }, { id: 0, transferId: newTransferId() });
 
             g.phase = 'streaming';
             g.lastHeartbeat = now();
@@ -1190,21 +1581,6 @@ async function handleGenerationUpdate(req, res, kind) {
             g.messageIndex = messageIndex;
             g.message = message;
             state.updatedAt = now();
-
-            commitPreparedEvents(state, [prepared]);
-
-            // Throttled durable write: the live message is transient (never
-            // persisted), and the full state file must not be serialized on
-            // every token. A crash in the throttle window discards the
-            // generation anyway; clients self-heal via generation_recovered
-            // and revision-mismatch resyncs.
-            const skey = `${userKey(req)}::${scopeKey(scope)}`;
-            const lastPersist = lastStreamPersistAt.get(skey) || 0;
-            if (now() - lastPersist >= STREAM_PERSIST_INTERVAL_MS) {
-                await persistState(req, scope, state);
-                markPersisted(state, tx);
-                lastStreamPersistAt.set(skey, now());
-            }
 
             publishPreparedEvent(req, scope, prepared);
             // Compact response: never the snapshot.
@@ -1245,7 +1621,6 @@ async function handleGenerationUpdate(req, res, kind) {
 
             await persistState(req, scope, state);
             markPersisted(state, tx);
-            lastStreamPersistAt.delete(`${userKey(req)}::${scopeKey(scope)}`);
             publishPreparedEvent(req, scope, prepared);
             // Terminal returns the full state: it is the authoritative final
             // checkpoint and runs once per generation, not on a hot path.
@@ -1324,6 +1699,7 @@ async function handleSse(req, res) {
     if (set.size >= LIMITS.maxSubscribersPerScope && !set.has(clientId)) return res.status(429).end();
 
     const lastId = Number(req.query?.lastEventId || req.get('last-event-id') || 0);
+    const supportsDelta = req.query?.delta === '1';
 
     res.status(200);
     res.setHeader('Content-Type', 'text/event-stream');
@@ -1337,7 +1713,7 @@ async function handleSse(req, res) {
         : { clientId, deviceId, joinedAt: now() };
     member.lastSeenAt = now();
 
-    const sub = createSubscriber(res, member);
+    const sub = createSubscriber(res, member, { supportsDelta });
 
     let replayEvents = null;
     let needResync = false;
@@ -1371,6 +1747,13 @@ async function handleSse(req, res) {
                     // A chunked durable event has no replayable payload in the
                     // state file. The only safe recovery is authoritative /state.
                     if (event.type === 'event_chunked') {
+                        needResync = true;
+                        replayEvents = null;
+                        break;
+                    }
+
+                    // Legacy clients cannot replay deltas.
+                    if (event.type === 'snapshot_delta' && !supportsDelta) {
                         needResync = true;
                         replayEvents = null;
                         break;
@@ -1436,6 +1819,13 @@ async function handleSse(req, res) {
                 if (event.type === 'generation_stream') continue;
 
                 if (event.type === 'event_chunked') {
+                    needResync = true;
+                    replayEvents = null;
+                    break;
+                }
+
+                // Legacy clients cannot replay deltas.
+                if (event.type === 'snapshot_delta' && !supportsDelta) {
                     needResync = true;
                     replayEvents = null;
                     break;
@@ -1581,6 +1971,7 @@ function init(router) {
     router.post('/heartbeat', handleHeartbeat);
     router.post('/state', handleState);
     router.post('/snapshot', handleSnapshot);
+    router.post('/delta', handleDelta);
     router.post('/generation/claim', handleGenerationClaim);
     router.post('/generation/heartbeat', (req, res) => handleGenerationUpdate(req, res, 'heartbeat'));
     router.post('/generation/started', (req, res) => handleGenerationUpdate(req, res, 'started'));
@@ -1600,7 +1991,6 @@ function exit() {
     subscribers.clear();
     scopes.clear();
     userLocks.clear();
-    lastStreamPersistAt.clear();
     routerRef = null;
 }
 
