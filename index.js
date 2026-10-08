@@ -24,10 +24,15 @@ const LIMITS = Object.freeze({
     maxScopesPerUser: 200,
     maxSubscribersPerScope: 25,
     maxBufferedSseBytes: 4 * 1024 * 1024,
-    // Strongest-durability switch (temp-file fsync + rename + dir fsync).
-    // Off by default: it is noticeably slower on every mutation.
     fsyncState: false,
 });
+
+// Stream updates are transient: persisting the full state on every ~60ms
+// token update is catastrophic for large chats. Throttle durable writes;
+// the live message lives in memory + SSE only, and a crash mid-stream kills
+// the generation anyway (clients recover via generation_recovered).
+const STREAM_PERSIST_INTERVAL_MS = 2_000;
+const lastStreamPersistAt = new Map();
 
 const scopes = new Map();
 const userLocks = new Map();
@@ -211,8 +216,6 @@ async function loadState(req, scope) {
         freshEntry.lastAccessed = now();
         scopes.set(key, freshEntry);
 
-        // Stale generation from a previous server instance: clear once, record
-        // the recovery event, persist — so the on-disk file stops carrying it.
         if (recovered) {
             const recovery = prepareEvent(state, { type: 'generation_recovered', generation: null }, { id: state.nextEventId });
             commitPreparedEvents(state, [recovery]);
@@ -235,9 +238,8 @@ async function loadState(req, scope) {
     return loading;
 }
 
-// Stream events are transient: the live message never lives in durable history.
-// Applied to both the persisted projection AND the in-memory event list so the
-// two can never diverge and memory stays bounded.
+// Stream events are transient: the live message never lives in durable or
+// in-memory history. Applied to event lists so memory stays bounded.
 function compactEvents(events) {
     if (!Array.isArray(events)) return events;
     return events.map(event => {
@@ -248,13 +250,26 @@ function compactEvents(events) {
     });
 }
 
+// Direct projection: NO full-state clone. The snapshot/scope are referenced —
+// JSON serialization never mutates them. The durable generation is
+// metadata-only; the live message is transient and must never hit disk.
 async function persistState(req, scope, state, { fsync = LIMITS.fsyncState } = {}) {
     const file = statePath(req, scope);
     await ensureDir(path.dirname(file));
 
-    const projected = clone(state);
-    projected.updatedAt = now();
-    projected.events = compactEvents(projected.events);
+    const projected = {
+        protocol: state.protocol,
+        schema: state.schema,
+        scope: state.scope,
+        revision: state.revision,
+        snapshot: state.snapshot,
+        generation: state.generation ? generationPublic(state.generation, false) : null,
+        events: compactEvents(state.events),
+        nextEventId: state.nextEventId,
+        recentOps: state.recentOps,
+        createdAt: state.createdAt,
+        updatedAt: now(),
+    };
     pruneEventHistory(projected);
 
     const payload = JSON.stringify(projected);
@@ -282,8 +297,8 @@ async function persistState(req, scope, state, { fsync = LIMITS.fsyncState } = {
         throw error;
     }
 
-    // Mirror the same compaction/pruning onto the in-memory state so the cache
-    // matches disk and long generations cannot grow memory without bound.
+    // Mirror compaction/pruning onto in-memory state so the cache matches disk
+    // and long generations cannot grow memory without bound.
     state.updatedAt = projected.updatedAt;
     if (Array.isArray(state.events)) {
         state.events = compactEvents(state.events);
@@ -307,8 +322,6 @@ function lockFor(key) {
     const current = new Promise(resolve => { release = resolve; });
     const chain = previous.catch(() => {}).then(() => current);
 
-    // Self-cleaning lock map: drop the entry once this link resolves and no
-    // newer waiter has replaced it.
     const cleanup = () => {
         if (userLocks.get(key) === chain) userLocks.delete(key);
     };
@@ -316,6 +329,46 @@ function lockFor(key) {
 
     userLocks.set(key, chain);
     return previous.catch(() => {}).then(() => release);
+}
+
+// Transaction model: one API mutation may contain multiple commit points
+// (recovery event, then the main mutation). Rollback restores to the LAST
+// successful commit, not to the initial state — otherwise a failed second
+// persist after a successful first one would leave un-persisted mutations in
+// memory. The generation object is snapshotted BY VALUE: handlers mutate it
+// in place, so a reference would roll back to the already-mutated object.
+function beginStateTransaction(state) {
+    const snap = {
+        revision: state.revision,
+        nextEventId: state.nextEventId,
+        eventsLength: state.events.length,
+        recentOpsLength: state.recentOps.length,
+        snapshot: state.snapshot,
+        generation: state.generation ? clone(state.generation) : null,
+    };
+    return { initial: snap, commitPoint: snap, persisted: false };
+}
+
+function markPersisted(state, tx) {
+    tx.persisted = true;
+    tx.commitPoint = {
+        revision: state.revision,
+        nextEventId: state.nextEventId,
+        eventsLength: state.events.length,
+        recentOpsLength: state.recentOps.length,
+        snapshot: state.snapshot,
+        generation: state.generation ? clone(state.generation) : null,
+    };
+}
+
+function rollbackTransaction(state, tx) {
+    const p = tx.persisted ? tx.commitPoint : tx.initial;
+    state.revision = p.revision;
+    state.nextEventId = p.nextEventId;
+    state.events.length = p.eventsLength;
+    state.recentOps.length = p.recentOpsLength;
+    state.snapshot = p.snapshot;
+    state.generation = p.generation;
 }
 
 async function withLock(req, scope, fn) {
@@ -328,34 +381,11 @@ async function withLock(req, scope, fn) {
         const result = await fn(state, tx);
         return result;
     } catch (error) {
-        // Rollback in-memory state only when nothing reached disk. Once any
-        // persist succeeded, disk is authoritative and memory must match it.
-        if (state && tx && !tx.persisted) rollbackTransaction(state, tx);
+        if (state && tx) rollbackTransaction(state, tx);
         throw error;
     } finally {
         release();
     }
-}
-
-function beginStateTransaction(state) {
-    return {
-        originalRevision: state.revision,
-        originalNextEventId: state.nextEventId,
-        originalEventsLength: state.events.length,
-        originalRecentOpsLength: state.recentOps.length,
-        originalSnapshot: state.snapshot,
-        originalGeneration: state.generation,
-        persisted: false,
-    };
-}
-
-function rollbackTransaction(state, tx) {
-    state.revision = tx.originalRevision;
-    state.nextEventId = tx.originalNextEventId;
-    state.events.length = tx.originalEventsLength;
-    state.recentOps.length = tx.originalRecentOpsLength;
-    state.snapshot = tx.originalSnapshot;
-    state.generation = tx.originalGeneration;
 }
 
 function rememberOp(state, opId) {
@@ -381,25 +411,29 @@ function revisionError(state) {
 // ---------------------------------------------------------------------------
 // Event preparation / chunking
 //
-// prepareEvent never mutates state. It assigns a candidate id (caller-supplied
-// or state.nextEventId), serializes once, and either returns a single normal
-// frame or chunk frames sharing one logical id plus a compact marker for
-// durable history. nextEventId only advances in commitPreparedEvents.
+// prepareEvent never mutates state. nextEventId only advances in
+// commitPreparedEvents. For generation_stream, the LIVE frames carry the full
+// message (SSE delivery needs it) but the durable storedEvent is compacted —
+// stream messages never sit in event history, in memory or on disk.
 // ---------------------------------------------------------------------------
 
 function prepareEvent(state, logicalEvent, { id = null, opId = null, transferId = null } = {}) {
     const eventId = id ?? state.nextEventId;
     const at = now();
 
-    const storedEvent = {
+    const fullEvent = {
         ...clone(logicalEvent),
         id: eventId,
         at,
         eventVersion: 1,
     };
 
-    const serialized = jsonToUtf8Bytes(storedEvent);
+    const serialized = jsonToUtf8Bytes(fullEvent);
     const totalBytes = serialized.length;
+
+    const durableEvent = logicalEvent.type === 'generation_stream'
+        ? { ...fullEvent, message: undefined, compacted: true }
+        : fullEvent;
 
     if (totalBytes <= LIMITS.maxEventBytes - 256) {
         return {
@@ -407,21 +441,17 @@ function prepareEvent(state, logicalEvent, { id = null, opId = null, transferId 
             id: eventId,
             at,
             opId,
-            storedEvent,
-            frames: [storedEvent],
+            storedEvent: durableEvent,
+            frames: [fullEvent],
             totalBytes,
             transferId,
         };
     }
 
-    // Hard ceiling: no single logical event may exceed the assembly budget.
     if (totalBytes > LIMITS.maxChunkAssemblyBytes) {
         throw new Error('event_too_large');
     }
 
-    // Oversized: chunk the serialized bytes. Every chunked transfer gets a
-    // unique transferId so the client can key assembly safely for both
-    // durable logical events and transient (hello/generation_state) sends.
     const effectiveTransferId = transferId || newTransferId();
     const eventSha256 = sha256Bytes(serialized);
     const chunkPayloadLimit = LIMITS.chunkPayloadBytes;
@@ -473,7 +503,6 @@ function prepareEvent(state, logicalEvent, { id = null, opId = null, transferId 
 }
 
 function prepareEvents(state, logicalEvents) {
-    // Sequential candidate ids across a batch; nothing is committed here.
     let nextId = state.nextEventId;
     const prepared = [];
     for (const { event, opId, transferId } of logicalEvents) {
@@ -492,9 +521,6 @@ function commitPreparedEvents(state, preparedEvents) {
 
 function publishPreparedEvent(req, scope, prepared) {
     const set = subscribers.get(`${userKey(req)}::${scopeKey(scope)}`) || new Map();
-    // Durable logical events carry their id on every frame so the client can
-    // dedupe and advance its cursor only after full reassembly. Transient
-    // sends (id 0) never touch the cursor.
     const sseId = prepared.id > 0 ? prepared.id : null;
     for (const sub of set.values()) {
         // Member-only placeholders (join without SSE, or a closed SSE
@@ -532,8 +558,6 @@ function enqueueSseFrame(sub, frame, logicalEventId) {
     if (sub.closed || !sub.outboundQueue) return;
     sub.outboundQueue.push({ frame, logicalEventId });
     sub.outboundBytes += utf8ByteLength(frame);
-    // Overflow check runs BEFORE the replaying early-return: a slow replay
-    // plus a burst of live chunked events must still hit the cap.
     if (sub.outboundBytes > LIMITS.maxBufferedSseBytes) {
         closeSubscriber(sub, 'buffer_overflow');
         return;
@@ -585,6 +609,11 @@ function createSubscriber(res, member) {
 
 // ---------------------------------------------------------------------------
 // Public state / generation
+//
+// publicState: full authoritative checkpoint (snapshot included) — /state,
+// /join, snapshot/claim/terminal success, and all 409 conflict bodies.
+// publicStateCompact: no snapshot — the hot generation paths (heartbeat,
+// started, stream, stop) must never clone/serialize a 12 MB chat.
 // ---------------------------------------------------------------------------
 
 function publicState(state) {
@@ -594,8 +623,18 @@ function publicState(state) {
         scope: clone(state.scope),
         revision: state.revision,
         snapshot: clone(state.snapshot),
-        // Routine HTTP state never carries the giant live message; that travels
-        // through SSE generation_state only.
+        generation: generationPublic(state.generation, false),
+        updatedAt: state.updatedAt,
+        lastEventId: state.nextEventId - 1,
+    };
+}
+
+function publicStateCompact(state) {
+    return {
+        protocol: state.protocol,
+        schema: state.schema,
+        scope: clone(state.scope),
+        revision: state.revision,
         generation: generationPublic(state.generation, false),
         updatedAt: state.updatedAt,
         lastEventId: state.nextEventId - 1,
@@ -720,8 +759,6 @@ function pruneExpiredMembers(skey) {
     const cutoff = now() - LIMITS.memberTtlMs;
     for (const [clientId, entry] of map.entries()) {
         if (!entry?.member || Number(entry.member.lastSeenAt || 0) < cutoff) {
-            // If a live SSE connection is attached, close it so the client
-            // reconnects instead of silently rotting as an unsubscribe ghost.
             if (entry?.res && !entry.closed) {
                 try { entry.res.end(); } catch { /* ignore */ }
             }
@@ -774,6 +811,9 @@ async function handlePing(req, res) {
     res.json({ ok: true, plugin: PLUGIN_ID, protocol: PROTOCOL, schema: SCHEMA, serverInstanceId });
 }
 
+// Two-phase join: an established scope never needs the client's snapshot, so
+// the client joins WITHOUT it first. Only when the server has no state at all
+// does it ask for a seed, and only then does the client upload the chat.
 async function handleJoin(req, res) {
     if (!requireAuth(req, res)) return;
     const body = req.body || {};
@@ -801,6 +841,12 @@ async function handleJoin(req, res) {
     try {
         enforceScopeCacheLimit(req);
         const state = await loadState(req, scope);
+
+        if (state.revision === 0 && set.size === 0 && !body.snapshot) {
+            // No server state and no other members: this client must seed.
+            return res.json({ ok: true, seedRequired: true, state: publicState(state), members: publicMembers(req, scope) });
+        }
+
         if (state.revision === 0 && set.size === 0 && body.snapshot) {
             // Initial seed is transactional: a failed persist rolls memory back.
             const tx = beginStateTransaction(state);
@@ -811,7 +857,7 @@ async function handleJoin(req, res) {
                     return res.status(413).json({ ok: false, error: 'snapshot_too_large' });
                 }
                 await persistState(req, scope, state);
-                tx.persisted = true;
+                markPersisted(state, tx);
             } catch (error) {
                 if (!tx.persisted) rollbackTransaction(state, tx);
                 if (error instanceof Error && ['snapshot_required', 'snapshot_messages_required', 'invalid_message', 'message_ids_required', 'duplicate_message_id'].includes(error.message)) {
@@ -820,7 +866,15 @@ async function handleJoin(req, res) {
                 throw error;
             }
         }
-        set.set(clientId, { member: { clientId, deviceId, joinedAt: now(), lastSeenAt: now() }, res: null });
+
+        const liveEntry = set.get(clientId);
+        if (liveEntry?.res && !liveEntry.closed) {
+            // A live SSE connection exists for this client: refresh membership
+            // in place instead of replacing the entry with a placeholder.
+            liveEntry.member = { clientId, deviceId, joinedAt: liveEntry.member?.joinedAt || now(), lastSeenAt: now() };
+        } else {
+            set.set(clientId, { member: { clientId, deviceId, joinedAt: now(), lastSeenAt: now() }, res: null });
+        }
         return res.json({ ok: true, state: publicState(state), members: publicMembers(req, scope) });
     } finally {
         release();
@@ -872,11 +926,10 @@ async function handleHeartbeat(req, res) {
             const prepared = prepareEvent(state, { type: 'generation_recovered', generation: null });
             commitPreparedEvents(state, [prepared]);
             await persistState(req, scope, state);
-            tx.persisted = true;
+            markPersisted(state, tx);
             publishPreparedEvent(req, scope, prepared);
         }
-        // Deliberately lean: revision + generation metadata only. The client's
-        // heartbeat handler uses exactly these fields; no snapshot payload.
+        // Lean: revision + generation metadata only.
         return res.json({ ok: true, revision: state.revision, generation: generationPublic(state.generation, false) });
     });
 }
@@ -895,7 +948,7 @@ async function handleState(req, res) {
             const prepared = prepareEvent(state, { type: 'generation_recovered', generation: null });
             commitPreparedEvents(state, [prepared]);
             await persistState(req, scope, state);
-            tx.persisted = true;
+            markPersisted(state, tx);
             publishPreparedEvent(req, scope, prepared);
         }
         return res.json({ ok: true, state: publicState(state), members: publicMembers(req, scope) });
@@ -929,7 +982,7 @@ async function handleSnapshot(req, res) {
             const recovery = prepareEvent(state, { type: 'generation_recovered', generation: null });
             commitPreparedEvents(state, [recovery]);
             await persistState(req, scope, state);
-            tx.persisted = true;
+            markPersisted(state, tx);
             publishPreparedEvent(req, scope, recovery);
         }
         if (state.generation) {
@@ -939,8 +992,6 @@ async function handleSnapshot(req, res) {
             return res.status(409).json(revisionError(state));
         }
 
-        // Prepare the event fully before any mutation. A failed prepare
-        // consumes no event id and changes nothing.
         const newRevision = state.revision + 1;
         const prepared = prepareEvent(state, {
             type: 'snapshot',
@@ -955,7 +1006,7 @@ async function handleSnapshot(req, res) {
         commitPreparedEvents(state, [prepared]);
 
         await persistState(req, scope, state);
-        tx.persisted = true;
+        markPersisted(state, tx);
         publishPreparedEvent(req, scope, prepared);
         return res.json({ ok: true, state: publicState(state) });
     });
@@ -986,7 +1037,7 @@ async function handleGenerationClaim(req, res) {
                 const recovery = prepareEvent(state, { type: 'generation_recovered', generation: null });
                 commitPreparedEvents(state, [recovery]);
                 await persistState(req, scope, state);
-                tx.persisted = true;
+                markPersisted(state, tx);
                 publishPreparedEvent(req, scope, recovery);
             }
         }
@@ -1003,8 +1054,6 @@ async function handleGenerationClaim(req, res) {
         const newRevision = state.revision + 1;
         const generation = makeGeneration(body, serverInstanceId);
 
-        // Both events prepared together with sequential ids; either both
-        // commit or neither does.
         const [snapshotEvent, claimEvent] = prepareEvents(state, [
             {
                 event: {
@@ -1032,7 +1081,7 @@ async function handleGenerationClaim(req, res) {
         commitPreparedEvents(state, [snapshotEvent, claimEvent]);
 
         await persistState(req, scope, state);
-        tx.persisted = true;
+        markPersisted(state, tx);
         publishPreparedEvent(req, scope, snapshotEvent);
         publishPreparedEvent(req, scope, claimEvent);
         return res.json({ ok: true, state: publicState(state) });
@@ -1060,18 +1109,17 @@ async function handleGenerationUpdate(req, res, kind) {
         if (kind === 'heartbeat') {
             g.lastHeartbeat = now();
             g.leaseUntil = now() + LIMITS.generationLeaseMs;
+            // Compact: no snapshot in a 5-second-interval response.
             return res.json({
                 ok: true,
-                state: publicState(state),
+                state: publicStateCompact(state),
                 stopRequested: !!g.stopRequested,
             });
         }
 
         if (kind === 'started') {
-            // Idempotent: a retried start after a lost response must not
-            // produce a second generation_started event.
             if (['started', 'streaming'].includes(g.phase)) {
-                return res.json({ ok: true, state: publicState(state), duplicate: true });
+                return res.json({ ok: true, state: publicStateCompact(state), duplicate: true });
             }
             g.phase = 'started';
             g.startedAt = g.startedAt || now();
@@ -1084,9 +1132,9 @@ async function handleGenerationUpdate(req, res, kind) {
             });
             commitPreparedEvents(state, [prepared]);
             await persistState(req, scope, state);
-            tx.persisted = true;
+            markPersisted(state, tx);
             publishPreparedEvent(req, scope, prepared);
-            return res.json({ ok: true, state: publicState(state) });
+            return res.json({ ok: true, state: publicStateCompact(state) });
         }
 
         if (kind === 'stream') {
@@ -1097,12 +1145,10 @@ async function handleGenerationUpdate(req, res, kind) {
             if (!Number.isInteger(seq)) {
                 return res.status(400).json({ ok: false, error: 'invalid_sequence' });
             }
-            // Idempotent same-seq retry: a timed-out accepted update returns
-            // the current state instead of corrupting the sequence.
             if (seq === g.seq) {
                 const sameMessageId = messageIdFromMessage(body.message) === g.messageId;
                 if (sameMessageId) {
-                    return res.json({ ok: true, state: publicState(state), stopRequested: !!g.stopRequested, duplicate: true });
+                    return res.json({ ok: true, state: publicStateCompact(state), stopRequested: !!g.stopRequested, duplicate: true });
                 }
                 return res.status(409).json({ ok: false, error: 'stream_sequence_conflict', expected: g.seq + 1 });
             }
@@ -1120,9 +1166,8 @@ async function handleGenerationUpdate(req, res, kind) {
             }
             const messageIndex = Number.isInteger(body.messageIndex) ? body.messageIndex : null;
 
-            // The event's generation metadata must reflect the POST-update
-            // state (phase/seq/messageId/messageIndex), built without mutating
-            // g so a failed prepare changes nothing.
+            // Event metadata reflects the POST-update state, built without
+            // mutating g so a failed prepare changes nothing.
             const updatedPublic = generationPublic(g, false);
             updatedPublic.phase = 'streaming';
             updatedPublic.seq = seq;
@@ -1147,10 +1192,23 @@ async function handleGenerationUpdate(req, res, kind) {
             state.updatedAt = now();
 
             commitPreparedEvents(state, [prepared]);
-            await persistState(req, scope, state);
-            tx.persisted = true;
+
+            // Throttled durable write: the live message is transient (never
+            // persisted), and the full state file must not be serialized on
+            // every token. A crash in the throttle window discards the
+            // generation anyway; clients self-heal via generation_recovered
+            // and revision-mismatch resyncs.
+            const skey = `${userKey(req)}::${scopeKey(scope)}`;
+            const lastPersist = lastStreamPersistAt.get(skey) || 0;
+            if (now() - lastPersist >= STREAM_PERSIST_INTERVAL_MS) {
+                await persistState(req, scope, state);
+                markPersisted(state, tx);
+                lastStreamPersistAt.set(skey, now());
+            }
+
             publishPreparedEvent(req, scope, prepared);
-            return res.json({ ok: true, state: publicState(state), stopRequested: !!g.stopRequested });
+            // Compact response: never the snapshot.
+            return res.json({ ok: true, state: publicStateCompact(state), stopRequested: !!g.stopRequested });
         }
 
         if (kind === 'terminal') {
@@ -1186,8 +1244,11 @@ async function handleGenerationUpdate(req, res, kind) {
             commitPreparedEvents(state, [prepared]);
 
             await persistState(req, scope, state);
-            tx.persisted = true;
+            markPersisted(state, tx);
+            lastStreamPersistAt.delete(`${userKey(req)}::${scopeKey(scope)}`);
             publishPreparedEvent(req, scope, prepared);
+            // Terminal returns the full state: it is the authoritative final
+            // checkpoint and runs once per generation, not on a hot path.
             return res.json({ ok: true, state: publicState(state) });
         }
 
@@ -1210,21 +1271,20 @@ async function handleGenerationStopRequest(req, res) {
     const opId = String(body.opId || '');
     return withLock(req, scope, async (state, tx) => {
         if (opId && hasOp(state, opId)) {
-            return res.json({ ok: true, state: publicState(state), duplicate: true });
+            return res.json({ ok: true, state: publicStateCompact(state), duplicate: true });
         }
         if (expireGeneration(state)) {
             const recovered = prepareEvent(state, { type: 'generation_recovered', generation: null });
             commitPreparedEvents(state, [recovered]);
             await persistState(req, scope, state);
-            tx.persisted = true;
+            markPersisted(state, tx);
             publishPreparedEvent(req, scope, recovered);
         }
         if (!state.generation) {
-            return res.json({ ok: true, state: publicState(state), alreadyStopped: true });
+            return res.json({ ok: true, state: publicStateCompact(state), alreadyStopped: true });
         }
         state.generation.stopRequested = true;
         state.updatedAt = now();
-        // Stop events never carry the giant live message.
         const prepared = prepareEvent(state, {
             type: 'generation_stop_requested',
             generation: generationPublic(state.generation, false),
@@ -1232,9 +1292,9 @@ async function handleGenerationStopRequest(req, res) {
         }, { opId: opId || null });
         commitPreparedEvents(state, [prepared]);
         await persistState(req, scope, state);
-        tx.persisted = true;
+        markPersisted(state, tx);
         publishPreparedEvent(req, scope, prepared);
-        return res.json({ ok: true, state: publicState(state) });
+        return res.json({ ok: true, state: publicStateCompact(state) });
     });
 }
 
@@ -1263,9 +1323,6 @@ async function handleSse(req, res) {
     if (!set) { set = new Map(); subscribers.set(skey, set); }
     if (set.size >= LIMITS.maxSubscribersPerScope && !set.has(clientId)) return res.status(429).end();
 
-    // The explicit query cursor reflects the client's accepted logical cursor
-    // at connect time and wins over the browser's Last-Event-ID header (which
-    // may be ahead of it mid-chunked-event).
     const lastId = Number(req.query?.lastEventId || req.get('last-event-id') || 0);
 
     res.status(200);
@@ -1282,10 +1339,6 @@ async function handleSse(req, res) {
 
     const sub = createSubscriber(res, member);
 
-    // Capture the replay plan AND the hello snapshot data under the lock, then
-    // register the subscriber. Everything committed before this moment is in
-    // the captured data; everything after is buffered while replaying. No gap,
-    // no duplicates, and hello cannot race a concurrent commit.
     const release = await lockFor(skey);
     let replayEvents = null;
     let needResync = false;
@@ -1310,13 +1363,20 @@ async function handleSse(req, res) {
                 replayEvents = [];
                 for (const event of state.events) {
                     if (event.id <= lastId) continue;
-                    if (event.type === 'generation_stream') continue; // transient: live state comes via generation_state
+                    if (event.type === 'generation_stream') continue;
                     if (event.type === 'event_chunked') { needResync = true; replayEvents = null; break; }
                     replayEvents.push(clone(event));
                 }
             }
         }
-        if (!needResync) set.set(clientId, sub);
+        if (!needResync) {
+            const prev = set.get(clientId);
+            if (prev && prev !== sub && prev.res && !prev.closed) {
+                // Same client reconnected: close the orphaned old connection.
+                try { prev.res.end(); } catch { /* ignore */ }
+            }
+            set.set(clientId, sub);
+        }
     } catch {
         release();
         try { res.end(); } catch { /* ignore */ }
@@ -1324,7 +1384,6 @@ async function handleSse(req, res) {
     }
     release();
 
-    // Dummy state: prepareEvent with an explicit id never reads nextEventId.
     const transientState = { nextEventId: 0 };
 
     try {
@@ -1338,7 +1397,6 @@ async function handleSse(req, res) {
             return;
         }
 
-        // hello stays small: generation metadata only.
         const hello = prepareEvent(transientState, {
             type: 'hello',
             protocol: PROTOCOL,
@@ -1350,8 +1408,6 @@ async function handleSse(req, res) {
         }, { id: 0 });
         for (const frame of hello.frames) sendSseFrame(res, frame, null);
 
-        // Full current generation (including the live message) follows via a
-        // transient generation_state transfer; chunked if large.
         const generationState = prepareEvent(transientState, {
             type: 'generation_state',
             revision: helloBase.revision,
@@ -1370,7 +1426,6 @@ async function handleSse(req, res) {
         return;
     }
 
-    // Replay finished: deliver anything buffered during it, then go live.
     sub.replaying = false;
     flushSubscriberQueue(sub);
 
@@ -1419,6 +1474,7 @@ function exit() {
     subscribers.clear();
     scopes.clear();
     userLocks.clear();
+    lastStreamPersistAt.clear();
     routerRef = null;
 }
 
