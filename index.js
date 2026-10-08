@@ -182,6 +182,10 @@ async function loadState(req, scope) {
             const raw = await fsp.readFile(statePath(req, scope), 'utf8');
             const parsed = JSON.parse(raw);
             state = migrateState(parsed, scope);
+            // A state file written by a broken intermediate version may omit
+            // event history. Normalize before anything reads .length on these.
+            if (!Array.isArray(state.events)) state.events = [];
+            if (!Array.isArray(state.recentOps)) state.recentOps = [];
             if (parsed.generation) recovered = true;
         } catch (error) {
             if (error?.code === 'ENOENT') {
