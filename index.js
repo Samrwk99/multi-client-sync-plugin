@@ -622,7 +622,7 @@ function publicState(state) {
         schema: state.schema,
         scope: clone(state.scope),
         revision: state.revision,
-        snapshot: clone(state.snapshot),
+        snapshot: state.snapshot,
         generation: generationPublic(state.generation, false),
         updatedAt: state.updatedAt,
         lastEventId: state.nextEventId - 1,
@@ -1339,50 +1339,176 @@ async function handleSse(req, res) {
 
     const sub = createSubscriber(res, member);
 
-    const release = await lockFor(skey);
     let replayEvents = null;
     let needResync = false;
     let helloBase = null;
+    let state = null;
+    let rejectTooManyClients = false;
+
+    // Read and build the initial replay plan without holding the mutation lock.
+    // Existing event objects are immutable after commit, so keeping references
+    // here avoids a large deep-clone of the entire replay history.
     try {
-        const state = await loadState(req, scope);
+        state = await loadState(req, scope);
+
+        const initialLastEventId = state.nextEventId - 1;
         const oldest = state.events[0]?.id || state.nextEventId;
 
-        helloBase = {
-            revision: state.revision,
-            lastEventId: state.nextEventId - 1,
-            generationMeta: generationPublic(state.generation, false),
-            generationFull: generationPublic(state.generation, true),
-            scope: clone(scope),
-            members: publicMembers(req, scope),
-        };
-
         if (Number.isInteger(lastId) && lastId > 0) {
+            // History no longer reaches the client's cursor.
             if (lastId < oldest - 1) {
                 needResync = true;
             } else {
                 replayEvents = [];
+
                 for (const event of state.events) {
                     if (event.id <= lastId) continue;
+
+                    // Stream history is intentionally transient and is never
+                    // replayed. The current generation_state is sent separately.
                     if (event.type === 'generation_stream') continue;
-                    if (event.type === 'event_chunked') { needResync = true; replayEvents = null; break; }
-                    replayEvents.push(clone(event));
+
+                    // A chunked durable event has no replayable payload in the
+                    // state file. The only safe recovery is authoritative /state.
+                    if (event.type === 'event_chunked') {
+                        needResync = true;
+                        replayEvents = null;
+                        break;
+                    }
+
+                    replayEvents.push(event);
                 }
             }
         }
-        if (!needResync) {
-            const prev = set.get(clientId);
-            if (prev && prev !== sub && prev.res && !prev.closed) {
-                // Same client reconnected: close the orphaned old connection.
-                try { prev.res.end(); } catch { /* ignore */ }
+
+        // Avoid cloning the potentially enormous live generation message here.
+        // prepareEvent() will perform the one required serialization clone later.
+        const generationFull = state.generation
+            ? {
+                ...generationPublic(state.generation, false),
+                message: state.generation.message || null,
             }
-            set.set(clientId, sub);
-        }
+            : null;
+
+        helloBase = {
+            revision: state.revision,
+            lastEventId: initialLastEventId,
+            generationMeta: generationPublic(state.generation, false),
+            generationFull,
+            scope: clone(scope),
+            members: publicMembers(req, scope),
+        };
     } catch {
-        release();
         try { res.end(); } catch { /* ignore */ }
         return;
     }
-    release();
+
+    // The lock is intentionally tiny. It reconciles anything committed while
+    // the unlocked replay plan was being built, then atomically installs the
+    // subscriber. This avoids forcing a resync merely because a normal event
+    // arrived during replay construction.
+    const release = await lockFor(skey);
+    try {
+        // Re-read the current state through loadState(). With the per-scope
+        // lock this is effectively a cheap cached lookup, while guaranteeing
+        // that the subscriber swap and event-history reconciliation use the
+        // current authoritative state.
+        const currentState = await loadState(req, scope);
+        const currentLastEventId = currentState.nextEventId - 1;
+        const currentOldest = currentState.events[0]?.id || currentState.nextEventId;
+
+        // If the requested cursor has fallen behind history pruning, there is
+        // no safe replay path left.
+        if (Number.isInteger(lastId) && lastId > 0 && lastId < currentOldest - 1) {
+            needResync = true;
+            replayEvents = null;
+        }
+
+        // Reconcile events committed after the unlocked read. Since event IDs
+        // are monotonically increasing and existing event objects are immutable,
+        // only the newly committed suffix needs to be added.
+        if (!needResync && currentLastEventId > helloBase.lastEventId) {
+            if (!replayEvents) replayEvents = [];
+
+            for (const event of currentState.events) {
+                if (event.id <= helloBase.lastEventId) continue;
+
+                if (event.type === 'generation_stream') continue;
+
+                if (event.type === 'event_chunked') {
+                    needResync = true;
+                    replayEvents = null;
+                    break;
+                }
+
+                // Avoid duplicating anything already present in the unlocked
+                // replay plan.
+                if (
+                    replayEvents.length === 0 ||
+                    replayEvents[replayEvents.length - 1]?.id !== event.id
+                ) {
+                    if (!replayEvents.some(existing => existing.id === event.id)) {
+                        replayEvents.push(event);
+                    }
+                }
+            }
+        }
+
+        // Refresh the hello snapshot from the current state after reconciliation.
+        // This makes the hello cursor describe exactly the replay boundary that
+        // was current when the subscriber was installed.
+        if (!needResync) {
+            helloBase.revision = currentState.revision;
+            helloBase.lastEventId = currentLastEventId;
+            helloBase.generationMeta = generationPublic(currentState.generation, false);
+
+            // Do not deep-clone the giant live message here. The object is only
+            // read later by prepareEvent(), which performs the serialization
+            // needed for the actual SSE transfer.
+            helloBase.generationFull = currentState.generation
+                ? {
+                    ...generationPublic(currentState.generation, false),
+                    message: currentState.generation.message || null,
+                }
+                : null;
+        }
+
+        // The subscriber map may have changed while the unlocked state read was
+        // running, so always reacquire the current map under the lock.
+        set = pruneExpiredMembers(skey);
+        if (!set) {
+            set = new Map();
+            subscribers.set(skey, set);
+        }
+
+        if (!needResync) {
+            if (set.size >= LIMITS.maxSubscribersPerScope && !set.has(clientId)) {
+                rejectTooManyClients = true;
+            } else {
+                const prev = set.get(clientId);
+
+                // Same client reconnecting: retire the old SSE connection before
+                // installing the new one. Its close handler cannot overwrite the
+                // new subscriber because it checks identity before replacing it.
+                if (prev && prev !== sub && prev.res && !prev.closed) {
+                    try { prev.res.end(); } catch { /* ignore */ }
+                }
+
+                member.lastSeenAt = now();
+                set.set(clientId, sub);
+            }
+        }
+    } catch {
+        needResync = true;
+        replayEvents = null;
+    } finally {
+        release();
+    }
+
+    if (rejectTooManyClients) {
+        closeSubscriber(sub, 'too_many_clients');
+        return res.status(429).end();
+    }
 
     const transientState = { nextEventId: 0 };
 
