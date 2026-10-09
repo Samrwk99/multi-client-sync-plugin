@@ -123,28 +123,68 @@ function canonicalSnapshot(input) {
 }
 
 function preserveTerminalSnapshot(state, incoming, generation) {
-    const existing = state?.snapshot;
-    if (!incoming || !Array.isArray(incoming.messages) || incoming.messages.length > 0) return incoming;
-    if (!existing || !Array.isArray(existing.messages) || existing.messages.length === 0) return incoming;
+    // A non-empty terminal snapshot can still be stale (for example, a tab
+    // switched chats and supplied its pre-generation baseline). Preserve the
+    // established history, then merge the terminal snapshot by stable message
+    // ID. Never use messageIndex as permission to overwrite another assistant.
+    const result = canonicalSnapshot(incoming);
+    const existingMessages = Array.isArray(state?.snapshot?.messages)
+        ? clone(state.snapshot.messages)
+        : [];
+    const incomingIds = new Set(result.messages.map(messageIdFromMessage).filter(Boolean));
+    let tombstones = readDeltaTombstones(result.metadata);
 
-    const preserved = clone(existing);
-    const streamed = isObject(generation?.message) ? clone(generation.message) : null;
-    const streamedId = messageIdFromMessage(streamed);
-    if (streamed && typeof streamedId === 'string' && jsonSafeId(streamedId)) {
-        const existingIndex = preserved.messages.findIndex(message => messageIdFromMessage(message) === streamedId);
-        if (existingIndex >= 0) {
-            preserved.messages[existingIndex] = streamed;
-        } else if (!streamed.is_user && !streamed.is_system) {
-            const hintedIndex = Number.isInteger(generation?.messageIndex) ? generation.messageIndex : -1;
-            if (hintedIndex >= 0 && hintedIndex < preserved.messages.length &&
-                !preserved.messages[hintedIndex]?.is_user && !preserved.messages[hintedIndex]?.is_system) {
-                preserved.messages[hintedIndex] = streamed;
-            } else {
-                preserved.messages.push(streamed);
+    // Reinsert existing messages omitted from the terminal payload unless the
+    // payload carries an explicit tombstone proving intentional deletion.
+    for (let i = 0; i < existingMessages.length; i += 1) {
+        const oldMessage = existingMessages[i];
+        const oldId = messageIdFromMessage(oldMessage);
+        if (!oldId || incomingIds.has(oldId) || Object.hasOwn(tombstones, oldId)) continue;
+
+        let insertAt = -1;
+        for (let j = i - 1; j >= 0; j -= 1) {
+            const priorId = messageIdFromMessage(existingMessages[j]);
+            if (!priorId) continue;
+            const priorIndex = result.messages.findIndex(message => messageIdFromMessage(message) === priorId);
+            if (priorIndex >= 0) {
+                insertAt = priorIndex + 1;
+                break;
             }
         }
+        if (insertAt < 0) {
+            for (let j = i + 1; j < existingMessages.length; j += 1) {
+                const nextId = messageIdFromMessage(existingMessages[j]);
+                if (!nextId) continue;
+                const nextIndex = result.messages.findIndex(message => messageIdFromMessage(message) === nextId);
+                if (nextIndex >= 0) {
+                    insertAt = nextIndex;
+                    break;
+                }
+            }
+        }
+        if (insertAt < 0) insertAt = Math.min(i, result.messages.length);
+        result.messages.splice(insertAt, 0, clone(oldMessage));
+        incomingIds.add(oldId);
     }
-    return canonicalSnapshot(preserved);
+
+    const streamed = isObject(generation?.message) ? clone(generation.message) : null;
+    const streamedId = messageIdFromMessage(streamed);
+    if (streamed && typeof streamedId === 'string' && jsonSafeId(streamedId) && !streamed.is_user && !streamed.is_system) {
+        const streamIndex = result.messages.findIndex(message => messageIdFromMessage(message) === streamedId);
+        if (streamIndex >= 0) {
+            result.messages[streamIndex] = streamed;
+        } else {
+            // The last cumulative frame is authoritative for this generated
+            // message. Append it; never substitute it for an unrelated index.
+            result.messages.push(streamed);
+        }
+        if (Object.hasOwn(tombstones, streamedId)) {
+            delete tombstones[streamedId];
+            result.metadata = writeDeltaTombstones(result.metadata, tombstones);
+        }
+    }
+
+    return canonicalSnapshot(result);
 }
 
 function defaultState(scope) {
@@ -177,6 +217,23 @@ function migrateState(parsed, scope) {
     // revision 0 = never seeded; revision >= 1 = established state.
     state.seeded = parsed.seeded === true || state.revision > 0;
     state.snapshot = canonicalSnapshot(parsed.snapshot || { messages: [], metadata: {} });
+    // A previous process cannot resume ownership, but it can recover the last
+    // accepted cumulative assistant frame stored by a heartbeat/state write.
+    // Merge by stable ID; never overwrite an unrelated assistant by index.
+    const checkpointMessage = isObject(parsed.generation?.message) ? clone(parsed.generation.message) : null;
+    const checkpointId = messageIdFromMessage(checkpointMessage);
+    if (
+        checkpointMessage &&
+        typeof checkpointId === 'string' &&
+        jsonSafeId(checkpointId) &&
+        !checkpointMessage.is_user &&
+        !checkpointMessage.is_system
+    ) {
+        const checkpointIndex = state.snapshot.messages.findIndex(message => messageIdFromMessage(message) === checkpointId);
+        if (checkpointIndex >= 0) state.snapshot.messages[checkpointIndex] = checkpointMessage;
+        else state.snapshot.messages.push(checkpointMessage);
+        state.snapshot = canonicalSnapshot(state.snapshot);
+    }
     state.events = Array.isArray(parsed.events) ? clone(parsed.events) : [];
     state.nextEventId = Number(parsed.nextEventId || 1);
     state.recentOps = (Array.isArray(parsed.recentOps) ? parsed.recentOps : [])
@@ -231,23 +288,63 @@ async function loadState(req, scope) {
             if (parsed.generation) recovered = true;
         } catch (error) {
             if (error?.code === 'ENOENT') {
-                // No file: fresh default state.
+                // No base state exists. Preserve an orphan journal for recovery;
+                // never apply deltas to a fabricated empty baseline.
+                const quarantineSuffix = `.orphan-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+                for (const orphanJournal of [deltaJournalPath(req, scope), generationJournalPath(req, scope)]) {
+                    try {
+                        await fsp.rename(orphanJournal, `${orphanJournal}${quarantineSuffix}`);
+                        console.warn(`[multi-client-sync] quarantined orphan journal for ${sha256(scopeKey(scope))}: ${path.basename(orphanJournal)}${quarantineSuffix}`);
+                    } catch (journalError) {
+                        if (journalError?.code !== 'ENOENT') throw journalError;
+                    }
+                }
             } else if (
                 error instanceof SyntaxError ||
                 (error instanceof Error && (
                     error.message.startsWith('unsupported_state_version') ||
-                    error.message === 'state_scope_mismatch' ||
-                    error.message === 'invalid_state_structure'
+                    [
+                        'state_scope_mismatch',
+                        'invalid_state_structure',
+                        'snapshot_required',
+                        'snapshot_messages_required',
+                        'invalid_message',
+                        'message_ids_required',
+                        'duplicate_message_id',
+                    ].includes(error.message)
                 ))
             ) {
-                // Incompatible or corrupt persisted state: delete it and start
-                // fresh. The scope re-seeds from the first client that joins.
-                // The state file is sync bookkeeping, never the chat's source
-                // of truth, so this is a safe standing upgrade policy.
+                // Never destroy the last recoverable checkpoint on parse/schema
+                // failure. Quarantine it, start an unseeded in-memory state, and
+                // let normal snapshot reconciliation repair it.
+                const file = statePath(req, scope);
+                const suffix = `.quarantine-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+                const quarantine = `${file}${suffix}`;
                 try {
-                    await fsp.unlink(statePath(req, scope));
-                } catch { /* best effort; file may already be gone */ }
-                console.warn(`[multi-client-sync] deleted incompatible state for ${sha256(scopeKey(scope))}: ${error.message}`);
+                    await fsp.rename(file, quarantine);
+                    console.warn(`[multi-client-sync] quarantined incompatible state for ${sha256(scopeKey(scope))}: ${error.message}; saved as ${path.basename(quarantine)}`);
+                } catch (quarantineError) {
+                    if (quarantineError?.code !== 'ENOENT') {
+                        // If quarantine itself fails, refuse to silently throw
+                        // the only persisted data away or pretend it was safe.
+                        throw quarantineError;
+                    }
+                    console.warn(`[multi-client-sync] no state file to quarantine for ${sha256(scopeKey(scope))}: ${error.message}`);
+                }
+                // The journal is meaningful only relative to its exact base state.
+                // Never replay it against defaultState after the base was quarantined.
+                const journalFile = deltaJournalPath(req, scope);
+                try {
+                    await fsp.rename(journalFile, `${journalFile}${suffix}`);
+                } catch (journalError) {
+                    if (journalError?.code !== 'ENOENT') throw journalError;
+                }
+                const streamFile = generationJournalPath(req, scope);
+                try {
+                    await fsp.rename(streamFile, `${streamFile}${suffix}`);
+                } catch (streamError) {
+                    if (streamError?.code !== 'ENOENT') throw streamError;
+                }
             } else {
                 throw error;
             }
@@ -260,10 +357,27 @@ async function loadState(req, scope) {
         // journaled events must never see those event IDs reused.
         const journal = await replayDeltaJournal(req, scope, state);
         if (!journal.ok) {
-            console.warn(`[multi-client-sync] delta journal corrupt for ${sha256(scopeKey(scope))}; discarding journal, keeping persisted state (valid prefix through event ${journal.highestEventId})`);
-            await clearDeltaJournal(req, scope);
+            console.warn(`[multi-client-sync] delta journal corrupt for ${sha256(scopeKey(scope))}; compacting valid replayed prefix through event ${journal.highestEventId}`);
             state.nextEventId = Math.max(state.nextEventId, journal.highestEventId + 1000);
+            // persistState atomically saves the checksum-valid replayed prefix
+            // and clears the journal only after the replacement state is durable.
+            // If persistence fails, loading fails and the journal remains intact.
+            await persistState(req, scope, state);
+            if (streamCheckpoint?.recovered) {
+                if (streamCheckpoint.corrupt) {
+                    // The last valid frame has been merged and persisted. Retain the
+                    // damaged journal for diagnosis instead of destroying evidence.
+                    await quarantineGenerationJournal(req, scope, 'corrupt');
+                } else {
+                    await clearGenerationJournal(req, scope);
+                }
+            }
         }
+
+        const streamCheckpoint = await replayGenerationJournal(req, scope, state);
+        if (streamCheckpoint.recovered) recovered = true;
+        if (streamCheckpoint.terminal) await clearGenerationJournal(req, scope);
+        if (streamCheckpoint.orphan) await quarantineGenerationJournal(req, scope, 'orphan');
 
         state.updatedAt = now();
         const freshEntry = scopes.get(key) || {};
@@ -275,9 +389,8 @@ async function loadState(req, scope) {
         if (recovered) {
             const recovery = prepareEvent(state, { type: 'generation_recovered', generation: null }, { id: state.nextEventId });
             commitPreparedEvents(state, [recovery]);
-            await persistState(req, scope, state);
-        }
 
+}
         return state;
     })();
 
@@ -308,7 +421,10 @@ async function persistState(req, scope, state, { fsync = LIMITS.fsyncState } = {
         revision: state.revision,
         seeded: state.seeded === true || Number(state.revision || 0) > 0,
         snapshot: state.snapshot,
-        generation: state.generation ? generationPublic(state.generation, false) : null,
+        // Persist the latest accepted cumulative stream message on durable state
+        // writes (heartbeats/start/terminal), not on every token. This bounds I/O
+        // while keeping a recoverable checkpoint if the process restarts mid-run.
+        generation: state.generation ? generationPublic(state.generation, true) : null,
         nextEventId: state.nextEventId,
         recentOps: state.recentOps,
         createdAt: state.createdAt,
@@ -951,6 +1067,28 @@ const forbiddenKeys = new Set(['__proto__', 'prototype', 'constructor']);
 
 // Null-prototype containers: message IDs are arbitrary attacker-adjacent
 // strings and must never resolve through Object.prototype.
+function snapshotDropsUnexplainedMessages(existingSnapshot, incomingSnapshot) {
+    if (!Array.isArray(existingSnapshot?.messages) || !Array.isArray(incomingSnapshot?.messages)) {
+        return true;
+    }
+
+    const incomingIds = new Set();
+    for (const message of incomingSnapshot.messages) {
+        const id = messageIdFromMessage(message);
+        if (typeof id !== 'string' || !jsonSafeId(id)) return true;
+        incomingIds.add(id);
+    }
+
+    const tombstones = readDeltaTombstones(incomingSnapshot.metadata);
+    for (const message of existingSnapshot.messages) {
+        const id = messageIdFromMessage(message);
+        if (typeof id !== 'string' || !jsonSafeId(id)) return true;
+        if (!incomingIds.has(id) && !Object.hasOwn(tombstones, id)) return true;
+    }
+
+    return false;
+}
+
 function readDeltaTombstones(metadata) {
     const meta = metadata?.[MCS_META_KEY];
     const tomb = meta?.tombstones;
@@ -1091,6 +1229,155 @@ function deltaJournalPath(req, scope) {
     return path.join(stateRoot(req), `${sha256(scopeKey(scope))}.delta.ndjson`);
 }
 
+function generationJournalPath(req, scope) {
+    return path.join(stateRoot(req), `${sha256(scopeKey(scope))}.generation.ndjson`);
+}
+
+async function clearGenerationJournal(req, scope) {
+    try {
+        await fsp.unlink(generationJournalPath(req, scope));
+    } catch (error) {
+        if (error?.code !== 'ENOENT') {
+            console.warn('[multi-client-sync] failed to clear generation journal:', error?.message || error);
+        }
+    }
+}
+
+async function quarantineGenerationJournal(req, scope, reason = 'corrupt') {
+    const file = generationJournalPath(req, scope);
+    const target = `${file}.${reason}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    try {
+        await fsp.rename(file, target);
+        console.warn(`[multi-client-sync] quarantined generation journal for ${sha256(scopeKey(scope))}: ${path.basename(target)}`);
+        return true;
+    } catch (error) {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+    }
+}
+
+async function appendGenerationCheckpoint(req, scope, generation, message, seq, messageIndex) {
+    const generationId = String(generation?.generationId || '');
+    const messageId = messageIdFromMessage(message);
+    if (
+        !jsonSafeId(generationId) ||
+        !jsonSafeId(messageId) ||
+        !isObject(message) ||
+        !Number.isInteger(seq) || seq < 1
+    ) {
+        throw new Error('invalid_generation_checkpoint');
+    }
+
+    const file = generationJournalPath(req, scope);
+    await ensureDir(path.dirname(file));
+    const core = {
+        version: 1,
+        scopeKey: scopeKey(scope),
+        generationId,
+        seq,
+        messageId,
+        messageIndex: Number.isInteger(messageIndex) ? messageIndex : null,
+        message: clone(message),
+        at: now(),
+    };
+    const recordSha256 = sha256Bytes(Buffer.from(JSON.stringify(core), 'utf8'));
+    const payload = `${JSON.stringify({ ...core, recordSha256 })}\n`;
+
+    // A stream POST is not acknowledged as accepted until this compact record is
+    // durable. Do not fsync the entire state file per frame.
+    const handle = await fsp.open(file, 'a', 0o600);
+    let originalSize = 0;
+    try {
+        originalSize = (await handle.stat()).size;
+        await handle.writeFile(payload, 'utf8');
+        await handle.sync();
+    } catch (error) {
+        // If this process remains alive after a write/fsync error, roll back a
+        // partial tail before any retry can append another record after it.
+        try {
+            await handle.truncate(originalSize);
+            await handle.sync();
+        } catch (truncateError) {
+            console.warn('[multi-client-sync] failed to roll back partial generation-journal append:', truncateError?.message || truncateError);
+        }
+        throw error;
+    } finally {
+        await handle.close();
+    }
+}
+
+async function replayGenerationJournal(req, scope, state) {
+    const file = generationJournalPath(req, scope);
+    let raw;
+    try {
+        raw = await fsp.readFile(file, 'utf8');
+    } catch (error) {
+        if (error?.code === 'ENOENT') return { recovered: false, corrupt: false };
+        throw error;
+    }
+
+    let latest = null;
+    let corrupt = false;
+    const lines = raw.split('\n');
+    for (const line of lines) {
+        if (!line.trim()) continue;
+        let record;
+        try {
+            record = JSON.parse(line);
+        } catch {
+            corrupt = true;
+            break;
+        }
+        const { recordSha256, ...core } = record || {};
+        const id = messageIdFromMessage(core.message);
+        const valid =
+            core.version === 1 &&
+            core.scopeKey === scopeKey(scope) &&
+            jsonSafeId(core.generationId) &&
+            Number.isInteger(core.seq) && core.seq >= 1 &&
+            jsonSafeId(core.messageId) &&
+            id === core.messageId &&
+            isObject(core.message) &&
+            typeof recordSha256 === 'string' &&
+            recordSha256 === sha256Bytes(Buffer.from(JSON.stringify(core), 'utf8'));
+        if (!valid) {
+            corrupt = true;
+            break;
+        }
+        latest = core;
+    }
+
+    if (!latest) return { recovered: false, corrupt, orphan: true };
+
+    const terminalWasCommitted = (Array.isArray(state.events) ? state.events : []).some(event =>
+        event?.type === 'generation_terminal' &&
+        String(event?.generation?.generationId || event?.generationId || '') === latest.generationId
+    );
+    if (terminalWasCommitted) return { recovered: false, corrupt, terminal: true };
+
+    if (!state.seeded && Number(state.revision || 0) === 0) {
+        return { recovered: false, corrupt, orphan: true };
+    }
+
+    const snapshot = canonicalSnapshot(state.snapshot || { messages: [], metadata: {} });
+    const existingIndex = snapshot.messages.findIndex(message => messageIdFromMessage(message) === latest.messageId);
+    if (existingIndex >= 0) {
+        snapshot.messages[existingIndex] = clone(latest.message);
+    } else if (!latest.message.is_user && !latest.message.is_system) {
+        // Never replace an unrelated message by index during recovery.
+        snapshot.messages.push(clone(latest.message));
+    }
+    state.snapshot = canonicalSnapshot(snapshot);
+    state.seeded = true;
+    state.updatedAt = now();
+
+    // A valid unterminated last record is repaired before any subsequent append.
+    if (!corrupt && raw && !raw.endsWith('\n')) {
+        await fsp.appendFile(file, '\n', { mode: 0o600 });
+    }
+    return { recovered: true, corrupt, generationId: latest.generationId, seq: latest.seq };
+}
+
 async function appendDeltaJournal(req, scope, prepared) {
     const file = deltaJournalPath(req, scope);
     await ensureDir(path.dirname(file));
@@ -1140,7 +1427,10 @@ async function replayDeltaJournal(req, scope, state) {
         } catch (error) {
             // Truncated final append is discardable; mid-file corruption is not.
             if (i === lines.length - 1) {
-                console.warn('[multi-client-sync] ignoring truncated final delta journal record');
+                console.warn('[multi-client-sync] truncating incomplete final delta journal record');
+                const lastNewline = raw.lastIndexOf('\n');
+                const validPrefix = lastNewline >= 0 ? raw.slice(0, lastNewline + 1) : '';
+                await fsp.truncate(deltaJournalPath(req, scope), Buffer.byteLength(validPrefix, 'utf8'));
                 break;
             }
             return { ok: false, highestEventId };
@@ -1164,6 +1454,7 @@ async function replayDeltaJournal(req, scope, state) {
 
         const event = record.event;
         const eventId = Number(event.id);
+        highestEventId = Math.max(highestEventId, Number.isFinite(eventId) ? eventId : 0);
         if (eventId < state.nextEventId) continue; // already compacted
         if (eventId !== state.nextEventId) return { ok: false, highestEventId };
         if (Number(event.baseRevision) !== Number(state.revision)) return { ok: false, highestEventId };
@@ -1179,6 +1470,13 @@ async function replayDeltaJournal(req, scope, state) {
         replayed = true;
     }
 
+    // appendDeltaJournal always appends newline-delimited records. Repair a
+    // valid final JSON record missing its newline so the next append cannot
+    // concatenate two records into one corrupt line.
+    const repairedRaw = await fsp.readFile(deltaJournalPath(req, scope), 'utf8').catch(() => '');
+    if (repairedRaw && !repairedRaw.endsWith('\n')) {
+        await fsp.appendFile(deltaJournalPath(req, scope), '\n', { mode: 0o600 });
+    }
     if (replayed) pruneEventHistory(state);
     return { ok: true, highestEventId };
 }
@@ -1488,6 +1786,9 @@ async function handleHeartbeat(req, res) {
             commitPreparedEvents(state, [prepared]);
             await persistState(req, scope, state);
             markPersisted(state, tx);
+            // The final snapshot is durable now. A crash before this unlink is safe:
+            // replay detects the matching terminal event and will not restore stale text.
+            await clearGenerationJournal(req, scope);
             publishPreparedEvent(req, scope, prepared);
         }
         // Lean: revision + generation metadata only.
@@ -1560,6 +1861,13 @@ async function handleSnapshot(req, res) {
                 state: publicState(state),
             });
         }
+        if (snapshotDropsUnexplainedMessages(state.snapshot, snap)) {
+            return res.status(409).json({
+                ok: false,
+                error: 'snapshot_would_drop_existing_messages',
+                state: publicState(state),
+            });
+        }
 
         const newRevision = state.revision + 1;
         const prepared = prepareEvent(state, {
@@ -1622,6 +1930,13 @@ async function handleGenerationClaim(req, res) {
             return res.status(409).json({
                 ok: false,
                 error: 'empty_snapshot_would_clear_chat',
+                state: publicState(state),
+            });
+        }
+        if (snapshotDropsUnexplainedMessages(state.snapshot, snap)) {
+            return res.status(409).json({
+                ok: false,
+                error: 'snapshot_would_drop_existing_messages',
                 state: publicState(state),
             });
         }
@@ -1737,13 +2052,27 @@ async function handleGenerationUpdate(req, res, kind) {
             }
             if (seq === g.seq) {
                 const sameMessageId = messageIdFromMessage(body.message) === g.messageId;
-                if (sameMessageId) {
+                const sameCumulativePayload = sameMessageId &&
+                    operationFingerprint([body.message]) === operationFingerprint([g.message]);
+                if (sameCumulativePayload) {
                     return res.json({ ok: true, state: publicStateCompact(state), stopRequested: !!g.stopRequested, duplicate: true });
                 }
-                return res.status(409).json({ ok: false, error: 'stream_sequence_conflict', expected: g.seq + 1 });
+                // Same sequence with different text is not a duplicate. Require the
+                // owner to rebase the newest cumulative frame to the next sequence.
+                return res.status(409).json({
+                    ok: false,
+                    error: 'stream_sequence_conflict',
+                    expected: Number(g.seq || 0) + 1,
+                    latestSeq: Number(g.seq || 0),
+                });
             }
             if (seq !== g.seq + 1) {
-                return res.status(409).json({ ok: false, error: 'stream_sequence_conflict', expected: g.seq + 1 });
+                return res.status(409).json({
+                    ok: false,
+                    error: 'stream_sequence_conflict',
+                    expected: Number(g.seq || 0) + 1,
+                    latestSeq: Number(g.seq || 0),
+                });
             }
 
             const message = clone(body.message);
@@ -1786,6 +2115,9 @@ async function handleGenerationUpdate(req, res, kind) {
             g.messageIndex = messageIndex;
             g.message = message;
             state.updatedAt = now();
+            // If the checkpoint write/fsync fails, do not publish or acknowledge
+            // this frame. withLock rolls the in-memory generation mutation back.
+            await appendGenerationCheckpoint(req, scope, g, message, seq, messageIndex);
 
             publishPreparedEvent(req, scope, prepared);
             // Compact response: never the snapshot.
@@ -1889,11 +2221,12 @@ async function handleGenerationStopRequest(req, res) {
             requesterClientId: member.clientId,
         }, { opId: opId || null, fp: opId ? stopFp : null });
         commitPreparedEvents(state, [prepared]);
-        // Publish the latency-sensitive event immediately; the generating
-        // client must not wait on persistence before learning it should stop.
-        publishPreparedEvent(req, scope, prepared);
+        // An event cannot be retracted if persistence fails and the in-memory
+        // transaction rolls back. Commit durability first; then broadcast the
+        // low-latency Stop decision to all subscribers.
         await persistState(req, scope, state);
         markPersisted(state, tx);
+        publishPreparedEvent(req, scope, prepared);
         return res.json({ ok: true, state: publicStateCompact(state) });
     });
 }
