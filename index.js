@@ -122,6 +122,31 @@ function canonicalSnapshot(input) {
     return { messages, metadata: clone(isObject(input.metadata) ? input.metadata : {}) };
 }
 
+function preserveTerminalSnapshot(state, incoming, generation) {
+    const existing = state?.snapshot;
+    if (!incoming || !Array.isArray(incoming.messages) || incoming.messages.length > 0) return incoming;
+    if (!existing || !Array.isArray(existing.messages) || existing.messages.length === 0) return incoming;
+
+    const preserved = clone(existing);
+    const streamed = isObject(generation?.message) ? clone(generation.message) : null;
+    const streamedId = messageIdFromMessage(streamed);
+    if (streamed && typeof streamedId === 'string' && jsonSafeId(streamedId)) {
+        const existingIndex = preserved.messages.findIndex(message => messageIdFromMessage(message) === streamedId);
+        if (existingIndex >= 0) {
+            preserved.messages[existingIndex] = streamed;
+        } else if (!streamed.is_user && !streamed.is_system) {
+            const hintedIndex = Number.isInteger(generation?.messageIndex) ? generation.messageIndex : -1;
+            if (hintedIndex >= 0 && hintedIndex < preserved.messages.length &&
+                !preserved.messages[hintedIndex]?.is_user && !preserved.messages[hintedIndex]?.is_system) {
+                preserved.messages[hintedIndex] = streamed;
+            } else {
+                preserved.messages.push(streamed);
+            }
+        }
+    }
+    return canonicalSnapshot(preserved);
+}
+
 function defaultState(scope) {
     return {
         protocol: PROTOCOL,
@@ -632,7 +657,32 @@ function sendSseFrame(res, event, id = null) {
 
 function enqueueSseFrame(sub, frame, logicalEventId) {
     if (sub.closed || !sub.outboundQueue) return;
-    sub.outboundQueue.push({ frame, logicalEventId });
+
+    const type = String(frame?.type || '');
+    const generationId = String(frame?.generationId || frame?.generation?.generationId || '');
+    const coalescibleStream = type === 'generation_stream' && !!generationId && frame?.cumulative === true;
+    const terminalOrStop = [
+        'generation_stop_requested', 'generation_terminal', 'generation_stopped', 'generation_completed',
+    ].includes(type);
+
+    // Cumulative stream frames supersede queued frames for the same generation. This bounds
+    // memory and keeps the remote tab close to the live edge when the client/socket is slow.
+    // Stop/terminal is authoritative, so discard queued transient stream frames for that generation;
+    // the terminal checkpoint carries the final durable content.
+    if ((coalescibleStream || terminalOrStop) && generationId) {
+        for (let i = sub.outboundQueue.length - 1; i >= 0; i -= 1) {
+            const queued = sub.outboundQueue[i];
+            const queuedType = String(queued?.frame?.type || '');
+            const queuedGenerationId = String(queued?.frame?.generationId || queued?.frame?.generation?.generationId || '');
+            if (queuedGenerationId !== generationId || queuedType !== 'generation_stream') continue;
+            const removed = sub.outboundQueue.splice(i, 1)[0];
+            sub.outboundBytes = Math.max(0, sub.outboundBytes - utf8ByteLength(removed.frame));
+        }
+    }
+
+    // Never duplicate a queued cumulative frame, but preserve ordering around durable events.
+    const item = { frame, logicalEventId };
+    sub.outboundQueue.push(item);
     sub.outboundBytes += utf8ByteLength(frame);
     if (sub.outboundBytes > LIMITS.maxBufferedSseBytes) {
         closeSubscriber(sub, 'buffer_overflow');
@@ -1503,6 +1553,13 @@ async function handleSnapshot(req, res) {
         if (Number(body.baseRevision) !== state.revision) {
             return res.status(409).json(revisionError(state));
         }
+        if (snap.messages.length === 0 && Array.isArray(state.snapshot?.messages) && state.snapshot.messages.length > 0) {
+            return res.status(409).json({
+                ok: false,
+                error: 'empty_snapshot_would_clear_chat',
+                state: publicState(state),
+            });
+        }
 
         const newRevision = state.revision + 1;
         const prepared = prepareEvent(state, {
@@ -1560,6 +1617,13 @@ async function handleGenerationClaim(req, res) {
         }
         if (Number(body.baseRevision) !== state.revision) {
             return res.status(409).json(revisionError(state));
+        }
+        if (snap.messages.length === 0 && Array.isArray(state.snapshot?.messages) && state.snapshot.messages.length > 0) {
+            return res.status(409).json({
+                ok: false,
+                error: 'empty_snapshot_would_clear_chat',
+                state: publicState(state),
+            });
         }
         if (bytes(snap) > LIMITS.maxSnapshotBytes) {
             return res.status(413).json({ ok: false, error: 'snapshot_too_large' });
@@ -1736,11 +1800,12 @@ async function handleGenerationUpdate(req, res, kind) {
             try { snap = canonicalSnapshot(body.snapshot); } catch (error) {
                 return res.status(400).json({ ok: false, error: error.message });
             }
+            snap = preserveTerminalSnapshot(state, snap, g);
             if (bytes(snap) > LIMITS.maxSnapshotBytes) {
                 return res.status(413).json({ ok: false, error: 'snapshot_too_large' });
             }
 
-            const terminalPhase = String(body.phase || 'completed');
+            const terminalPhase = g.stopRequested ? 'stopped' : String(body.phase || 'completed');
             const terminalFp = operationFingerprint([member.clientId, 'terminal', g.generationId, terminalPhase, snap]);
 
             const prior = findOp(state, opId);
@@ -1805,6 +1870,16 @@ async function handleGenerationStopRequest(req, res) {
         }
         if (!state.generation) {
             return res.json({ ok: true, state: publicStateCompact(state), alreadyStopped: true });
+        }
+        const requestedGenerationId = String(body.generationId || '');
+        if (requestedGenerationId && requestedGenerationId !== state.generation.generationId) {
+            // A delayed Stop from an old chat/generation must never stop the
+            // generation that currently owns this scope.
+            return res.status(409).json({
+                ok: false,
+                error: 'generation_mismatch',
+                state: publicStateCompact(state),
+            });
         }
         state.generation.stopRequested = true;
         state.updatedAt = now();
